@@ -377,20 +377,53 @@ class ModernPianoBackend(LiveBackendBase):
         self.melody_keep_top = 2
         self.fixed_window_mode = False
         self._actions_cache: Optional[List[PianoAction]] = None
+        self._action_cache_signature: Optional[tuple] = None
 
     def prepare(self, analysis: MidiAnalysisResult) -> BackendPlaybackHandle:
         handle = super().prepare(analysis)
         self._prime_action_cache()
         return handle
 
+    def _current_action_cache_signature(self) -> Optional[tuple]:
+        if not self.analysis:
+            return None
+        notes = self.analysis.notes
+        pedals = self.analysis.pedal_events
+        note_head = tuple((n.start_sec, n.end_sec, n.midi_note, n.velocity) for n in notes[:3])
+        note_tail = tuple((n.start_sec, n.end_sec, n.midi_note, n.velocity) for n in notes[-3:]) if len(notes) > 3 else ()
+        pedal_head = tuple((p.time_sec, p.is_down, p.track_index) for p in pedals[:3])
+        pedal_tail = tuple((p.time_sec, p.is_down, p.track_index) for p in pedals[-3:]) if len(pedals) > 3 else ()
+        return (
+            len(notes), note_head, note_tail,
+            len(pedals), pedal_head, pedal_tail,
+            tuple(self.keymap), self.base_leftmost, self.visible_octaves, self.window_size, self.window_rightmost,
+            self.overall_min_note, self.overall_max_note, self.auto_transpose, self.use_pedal, round(self.min_note_len, 4),
+            self.use_shift_octave, self.auto_shift_from_range, self.shift_key, self.switch_margin, self.min_notes_between_switches,
+            round(self.shift_weight, 4), round(self.retrigger_gap, 4), self.retrigger_mode, self.retrigger_priority,
+            self.lookahead_groups, round(self.pedal_tap_time, 4), self.chord_priority, round(self.chord_split_threshold, 4),
+            self.octave_fold_priority, round(self.octave_fold_weight, 4), self.max_melodic_jump_after_fold,
+            self.bar_aware_transpose, self.bar_transpose_scope, self.bar_transpose_threshold,
+            self.shift_hold_bass, self.shift_hold_max_note, self.shift_hold_max_chord_rank,
+            self.shift_hold_conflict_clear, round(self.shift_hold_release_delay, 4),
+            self.octave_avoid_collision, self.octave_preview_neighbors,
+            self.melody_priority, round(self.melody_pitch_weight, 4), round(self.melody_duration_weight, 4),
+            round(self.melody_continuity_weight, 4), self.melody_keep_top, self.fixed_window_mode,
+        )
+
     def _prime_action_cache(self) -> None:
         if not self.analysis:
             self._actions_cache = None
+            self._action_cache_signature = None
+            return
+        signature = self._current_action_cache_signature()
+        if signature is not None and signature == self._action_cache_signature and self._actions_cache is not None:
             return
         try:
             self._actions_cache = self._build_actions(self.analysis.notes, self.analysis.pedal_events)
+            self._action_cache_signature = signature
         except Exception:
             self._actions_cache = None
+            self._action_cache_signature = None
 
     def _run_from_position(self, handle: BackendPlaybackHandle, position_sec: float) -> None:
         if not self.analysis:

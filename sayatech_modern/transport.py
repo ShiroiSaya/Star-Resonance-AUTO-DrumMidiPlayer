@@ -40,6 +40,8 @@ class TransportController(QObject):
         self._play_debounce_sec = 0.25
 
     def set_backend(self, backend: PlaybackBackend) -> None:
+        if self.backend is backend:
+            return
         if self.state == TransportState.PLAYING:
             self.stop()
         self.backend = backend
