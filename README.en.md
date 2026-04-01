@@ -1,11 +1,12 @@
 <p align="center">
-  <img src="docs/assets/logo.png" alt="SayaTech-Midi-Studio Logo" width="120" />
+  <img src="docs/assets/logo.png" alt="SayaTech-Midi-Studio Logo" width="160">
 </p>
 
 <h1 align="center">SayaTech-Midi-Studio</h1>
 
 <p align="center">
-  A Windows MIDI auto-play tool for the in-game instruments of “星痕共鸣”
+  A Windows MIDI auto-performance tool for <b>Star Resonance</b>.<br>
+  Supports <b>Piano / Guitar / Bass / Drum</b>, auto tuning, ensemble timing, themes, and a modern desktop UI.
 </p>
 
 <p align="center">
@@ -15,80 +16,97 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-4c8bf5" alt="Platform" />
-  <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB" alt="Python" />
-  <img src="https://img.shields.io/badge/License-MIT-111111" alt="License" />
+  <a href="https://github.com/ShiroiSaya/SayaTech-Midi-Studio"><img alt="Repository" src="https://img.shields.io/badge/GitHub-Repository-181717?logo=github"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-MIT-green.svg"></a>
 </p>
 
 <p align="center">
-  <img src="docs/assets/banner.svg" alt="SayaTech-Midi-Studio Banner" />
+  <img src="docs/assets/banner.png" alt="SayaTech-Midi-Studio Banner">
 </p>
 
 ## Overview
 
-SayaTech-Midi-Studio converts MIDI files into keyboard input for the instrument gameplay of “星痕共鸣”. It is built around a desktop GUI and currently provides two workspace groups:
+SayaTech-Midi-Studio converts MIDI files into keyboard input for in-game instrument performance in **Star Resonance**. The project is built around a desktop GUI and provides workspaces for **Piano / Guitar / Bass** and **Drum**, together with range adaptation, interval movement, sustain pedal handling, auto tuning, ensemble timing, and visual previews.
 
-- **Piano / Guitar / Bass**
-- **Drums**
+It is not just a packaged script. It is a desktop workflow designed for daily use and distribution:
 
-Rather than being a loose collection of scripts, the project is organized as a desktop tool for everyday use, tuning, testing, and distribution. It focuses on practical in-game workflows such as track filtering, visual previews, interval movement, pedal handling, auto tuning, ensemble scheduling, and a modern UI.
+- GUI main window and parameter panels
+- Piano / Guitar / Bass workspace
+- Drum workspace
+- MIDI track selection, piano-roll preview, and drum preview
+- Auto tuning and config templates
+- Themes, dark mode, glass effects, and splash screen
+- Packaging and installer scripts for release builds
 
 ## Preview
 
-### Main screen
-![Home](docs/assets/home.png)
+### Main Window
 
-### Piano / Guitar / Bass
-![Piano](docs/assets/piano.png)
+![Home](docs/assets/screenshot-home-empty.png)
 
-### Drums
-![Drum](docs/assets/drum.png)
+### Piano / Guitar / Bass Page
 
-### Settings
-![Settings](docs/assets/settings.png)
+![Piano Guitar Bass](docs/assets/screenshot-piano.png)
 
-### Dark mode
-![Dark Mode](docs/assets/dark.png)
+### Drum Page
+
+![Drum](docs/assets/screenshot-drum.png)
+
+### Settings Page
+
+![Settings](docs/assets/screenshot-settings.png)
+
+### Splash Screen
+
+![Splash](docs/assets/screenshot-splash.png)
+
+### Dark Mode
+
+![Dark Mode](docs/assets/screenshot-dark.png)
 
 ## Features
 
-### Playback
-- MIDI auto-play for piano / guitar / bass
-- MIDI auto-play for drums
-- play / pause / stop hotkeys
+### Performance and Playback
+
+- Piano / Guitar / Bass MIDI auto-play
+- Drum MIDI auto-play
+- Play / Pause / Stop hotkeys
 - MIDI track filtering and recommendations
-- piano-roll preview, drum-lane preview, and timeline seeking
+- Piano-roll preview, drum preview, and timeline-assisted seeking
 
-### Range and mapping
-- automatic playable-range adaptation
-- interval movement logic
-- pedal handling and retrigger controls
-- separate parameter sets for piano / guitar / bass and drums
-- editable `config.txt` with a default template
+### Range and Key Mapping
 
-### Auto tuning and utilities
-- auto tuning and parameter suggestions
-- ensemble scheduling
-- Beijing time synchronization
-- runtime logs and crash logs
+- Automatic playable-range adaptation
+- Interval movement and short-range fixed-window logic
+- Sustain pedal handling and retrigger control
+- Separate parameter sets for Piano / Guitar / Bass and Drum
+- Default templates with editable `config.txt`
 
-### UI and workflow
-- multiple visual themes
-- dark mode
-- glass-style background effect
-- optional splash screen
-- clearer parameter naming and hover descriptions
+### Ensemble and Tools
+
+- Ensemble scheduling
+- Beijing time sync
+- Auto tuning and parameter suggestions
+- Runtime logs and crash logs
+
+### UI Experience
+
+- Multiple themes
+- Dark mode
+- Glass background effect
+- Optional splash screen
+- Clearer parameter naming and hover hints
 
 ## Environment
 
 - Windows 10 / 11
 - Python 3.10+
-- PySide6 GUI environment
-- intended for “星痕共鸣” instrument gameplay that maps MIDI to keyboard input
+- PySide6 desktop GUI environment
+- Intended for instrument performance in **Star Resonance**, where MIDI is mapped to keyboard input
 
 ## Installation and Run
 
-### Run from source
+### Run from Source
 
 ```bash
 git clone https://github.com/ShiroiSaya/SayaTech-Midi-Studio.git
@@ -97,29 +115,31 @@ pip install -r requirements.txt
 python app.py
 ```
 
-### Release file naming
+### Release Naming
 
-The source repository does not include prebuilt binaries by default. Recommended release names:
+Source repositories do not include built binaries by default. Recommended release filenames:
 
 - `SayaTech_MIDI_Studio_Setup.exe`: Windows installer
 - `SayaTech_MIDI_Studio.exe`: single-file portable build
 
-Release page: <https://github.com/ShiroiSaya/SayaTech-Midi-Studio/releases>
+Releases: <https://github.com/ShiroiSaya/SayaTech-Midi-Studio/releases>
 
 ## Build
 
 ### Single-file EXE
-Use the included scripts or build directly with PyInstaller:
 
-- output: `dist/SayaTech_MIDI_Studio.exe`
+Build with the included scripts or directly with PyInstaller:
 
-### Installer
-The recommended release pipeline is `onedir + Inno Setup`:
+- Output: `dist/SayaTech_MIDI_Studio.exe`
 
-- directory build: `dist/SayaTech_MIDI_Studio/`
-- installer build: `installer_output/SayaTech_MIDI_Studio_Setup.exe`
+### Installer Build
 
-## Repository layout
+Using `onedir + Inno Setup` is recommended for faster startup and more stable distribution:
+
+- Directory build: `dist/SayaTech_MIDI_Studio/`
+- Installer output: `installer_output/SayaTech_MIDI_Studio_Setup.exe`
+
+## Repository Structure
 
 ```text
 .
@@ -139,11 +159,11 @@ The recommended release pipeline is `onedir + Inno Setup`:
 
 ## Notes
 
-- Light mode supports the background image and glass-style effects.
-- Dark mode disables the background image automatically for better readability.
-- Drum parameters are separated from the piano / guitar / bass parameter page.
-- Auto tuning suggestions are best applied first and then verified in playback, instead of replacing every custom setting blindly.
+- Light mode supports a background image and glass effects
+- Dark mode disables the background automatically for readability and stability
+- The app reads `config.txt` first; if it is missing, a default template is generated automatically
+- The screenshots in this README are taken from the current project UI
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is released under the MIT License. See [LICENSE](LICENSE) for details.
