@@ -61,24 +61,84 @@ def _ui_dark_mode() -> bool:
     return bool(app.property("uiDarkMode")) if app else False
 
 
-def _vk_from_single_key(sequence_text: str) -> Optional[int]:
-    text = (sequence_text or "").strip().upper()
-    if not text or '+' in text:
-        return None
-    if text.startswith('F') and text[1:].isdigit():
-        num = int(text[1:])
-        if 1 <= num <= 24:
-            return 0x6F + num
-    if len(text) == 1 and 'A' <= text <= 'Z':
-        return ord(text)
-    if len(text) == 1 and '0' <= text <= '9':
-        return ord(text)
+def _qt_key_to_vk(key: int) -> Optional[int]:
+    if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+        return ord(chr(key))
+    if Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+        return ord(chr(key))
+    if Qt.Key.Key_F1 <= key <= Qt.Key.Key_F24:
+        return 0x70 + (int(key) - int(Qt.Key.Key_F1))
     mapping = {
-        'SPACE': 0x20, 'TAB': 0x09, 'ESC': 0x1B, 'ESCAPE': 0x1B,
-        'INSERT': 0x2D, 'DELETE': 0x2E, 'HOME': 0x24, 'END': 0x23,
-        'PGUP': 0x21, 'PAGEUP': 0x21, 'PGDN': 0x22, 'PAGEDOWN': 0x22,
+        int(Qt.Key.Key_Space): 0x20,
+        int(Qt.Key.Key_Tab): 0x09,
+        int(Qt.Key.Key_Backtab): 0x09,
+        int(Qt.Key.Key_Escape): 0x1B,
+        int(Qt.Key.Key_Backspace): 0x08,
+        int(Qt.Key.Key_Return): 0x0D,
+        int(Qt.Key.Key_Enter): 0x0D,
+        int(Qt.Key.Key_Insert): 0x2D,
+        int(Qt.Key.Key_Delete): 0x2E,
+        int(Qt.Key.Key_Home): 0x24,
+        int(Qt.Key.Key_End): 0x23,
+        int(Qt.Key.Key_PageUp): 0x21,
+        int(Qt.Key.Key_PageDown): 0x22,
+        int(Qt.Key.Key_Left): 0x25,
+        int(Qt.Key.Key_Up): 0x26,
+        int(Qt.Key.Key_Right): 0x27,
+        int(Qt.Key.Key_Down): 0x28,
+        int(Qt.Key.Key_Comma): 0xBC,
+        int(Qt.Key.Key_Period): 0xBE,
+        int(Qt.Key.Key_Slash): 0xBF,
+        int(Qt.Key.Key_Semicolon): 0xBA,
+        int(Qt.Key.Key_Apostrophe): 0xDE,
+        int(Qt.Key.Key_BracketLeft): 0xDB,
+        int(Qt.Key.Key_BracketRight): 0xDD,
+        int(Qt.Key.Key_Minus): 0xBD,
+        int(Qt.Key.Key_Equal): 0xBB,
+        int(Qt.Key.Key_Backslash): 0xDC,
+        int(Qt.Key.Key_QuoteLeft): 0xC0,
     }
-    return mapping.get(text)
+    return mapping.get(int(key))
+
+
+def _parse_hotkey_binding(sequence_text: str) -> Optional[tuple[int, tuple[int, ...]]]:
+    text = (sequence_text or '').strip()
+    if not text:
+        return None
+    seq = QKeySequence.fromString(text, QKeySequence.PortableText)
+    if seq.isEmpty():
+        seq = QKeySequence.fromString(text, QKeySequence.NativeText)
+    if seq.isEmpty():
+        return None
+    first = seq[0]
+    if hasattr(first, 'key'):
+        key = int(first.key())
+        mods = first.keyboardModifiers()
+    else:
+        combo = int(first)
+        modifier_mask = int(
+            Qt.KeyboardModifier.ShiftModifier
+            | Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.AltModifier
+            | Qt.KeyboardModifier.MetaModifier
+            | Qt.KeyboardModifier.KeypadModifier
+            | Qt.KeyboardModifier.GroupSwitchModifier
+        )
+        key = combo & ~modifier_mask
+        mods = Qt.KeyboardModifiers(combo & modifier_mask)
+    vk_code = _qt_key_to_vk(key)
+    if vk_code is None:
+        return None
+    modifier_vks: List[int] = []
+    if mods & Qt.KeyboardModifier.ControlModifier:
+        modifier_vks.extend([0xA2, 0xA3])
+    if mods & Qt.KeyboardModifier.ShiftModifier:
+        modifier_vks.extend([0xA0, 0xA1])
+    if mods & Qt.KeyboardModifier.AltModifier:
+        modifier_vks.extend([0xA4, 0xA5])
+    if mods & Qt.KeyboardModifier.MetaModifier:
+        modifier_vks.extend([0x5B, 0x5C])
+    return vk_code, tuple(modifier_vks)
 
 
 def _pretty_hotkey(sequence_text: str) -> str:
@@ -585,7 +645,7 @@ class SettingsDialog(FadeDialog):
     def _accept(self) -> None:
         keys = {}
         for name, edit in self.hotkey_edits.items():
-            seq = edit.keySequence().toString(QKeySequence.NativeText).strip()
+            seq = edit.keySequence().toString(QKeySequence.PortableText).strip()
             keys[name] = seq.upper()
         enabled_names = [name for name, sw in self.hotkey_switches.items() if sw.isChecked()]
         active_values = [keys[name] for name in enabled_names if keys[name]]
@@ -650,7 +710,7 @@ class MainWindow(QMainWindow):
         self.selected_piano_tracks: set[int] = set()
         self.selected_drum_tracks: set[int] = set()
         self._hotkey_last_trigger: Dict[str, float] = {"play": 0.0, "pause": 0.0, "stop": 0.0}
-        self._global_hotkey_state: Dict[int, bool] = {}
+        self._global_hotkey_state: Dict[tuple[int, tuple[int, ...]], bool] = {}
         self._last_applied_stylesheet = ""
 
         self._apply_ui_settings(initial=True)
@@ -1537,21 +1597,26 @@ class MainWindow(QMainWindow):
             user32 = ctypes.windll.user32
         except Exception:
             return
-        bindings: List[tuple[Optional[int], str, Callable[[], None], bool]] = [
-            (_vk_from_single_key(self.ui_settings.play_hotkey), 'play', self._request_play_hotkey, self.ui_settings.play_hotkey_enabled),
-            (_vk_from_single_key(self.ui_settings.pause_hotkey), 'pause', self._request_pause_hotkey, self.ui_settings.pause_hotkey_enabled),
-            (_vk_from_single_key(self.ui_settings.stop_hotkey), 'stop', self._request_stop_hotkey, self.ui_settings.stop_hotkey_enabled),
+        bindings: List[tuple[Optional[tuple[int, tuple[int, ...]]], str, Callable[[], None], bool]] = [
+            (_parse_hotkey_binding(self.ui_settings.play_hotkey), 'play', self._request_play_hotkey, self.ui_settings.play_hotkey_enabled),
+            (_parse_hotkey_binding(self.ui_settings.pause_hotkey), 'pause', self._request_pause_hotkey, self.ui_settings.pause_hotkey_enabled),
+            (_parse_hotkey_binding(self.ui_settings.stop_hotkey), 'stop', self._request_stop_hotkey, self.ui_settings.stop_hotkey_enabled),
         ]
-        for vk_code, _name, callback, enabled in bindings:
-            if vk_code is None:
+        for binding, _name, callback, enabled in bindings:
+            if binding is None:
                 continue
+            vk_code, modifier_vks = binding
             pressed = False
             if enabled:
-                pressed = bool(user32.GetAsyncKeyState(vk_code) & 0x8000)
-            prev = self._global_hotkey_state.get(vk_code, False)
+                main_pressed = bool(user32.GetAsyncKeyState(vk_code) & 0x8000)
+                modifiers_pressed = True
+                if modifier_vks:
+                    modifiers_pressed = all(bool(user32.GetAsyncKeyState(mod_vk) & 0x8000) for mod_vk in modifier_vks)
+                pressed = main_pressed and modifiers_pressed
+            prev = self._global_hotkey_state.get(binding, False)
             if pressed and not prev:
                 callback()
-            self._global_hotkey_state[vk_code] = pressed
+            self._global_hotkey_state[binding] = pressed
 
     def _hotkey_ready(self, channel: str) -> bool:
         now = time.monotonic()
@@ -2018,8 +2083,25 @@ class MainWindow(QMainWindow):
         if "UNLOCKED_MAX_NOTE" in self.tuner_suggestions:
             self.tuner_max_note_edit.setText(cfg_midi_to_note_name(int(self.tuner_suggestions["UNLOCKED_MAX_NOTE"])))
         self._load_config_into_form()
-        self.pages.setCurrentIndex(1)
+        if hasattr(self, 'nav_list') and self.nav_list is not None:
+            row = -1
+            for i in range(self.nav_list.count()):
+                item = self.nav_list.item(i)
+                if item and item.data(Qt.UserRole) == "config":
+                    row = i
+                    break
+            if row >= 0:
+                self.nav_list.blockSignals(True)
+                self.nav_list.setCurrentRow(row)
+                self.nav_list.blockSignals(False)
+        if hasattr(self, 'pages') and self.pages is not None:
+            fade_to = getattr(self.pages, 'fade_to_index', None)
+            if callable(fade_to):
+                fade_to(1)
+            else:
+                self.pages.setCurrentIndex(1)
         self.current_mode = "config"
+        self._sync_mode_cards()
         self._apply_runtime_config_to_backends()
         self._log("已将自动调参建议回填到配置页。")
 
