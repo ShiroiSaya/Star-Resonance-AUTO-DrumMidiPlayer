@@ -11,9 +11,12 @@ DEFAULT_ITEMS: List[tuple[str, str]] = [
     ("START_DELAY", "3.0"),
     ("MIN_NOTE_LEN", "0.15"),
     ("MAX_SIMULTANEOUS", "none"),
-    ("RETRIGGER_GAP", "0.003"),
+    ("RETRIGGER_GAP", "0.021"),
+    ("HIGH_FREQ_COMPAT", "false"),
+    ("HIGH_FREQ_RELEASE_ADVANCE", "0.000"),
     ("RETRIGGER_MODE", "true"),
     ("RETRIGGER_PRIORITY", "latest"),
+    ("INSTRUMENT_MODE", "钢琴"),
     ("LEFTMOST_NOTE", "C3"),
     ("VISIBLE_OCTAVES", "3"),
     ("UNLOCKED_MIN_NOTE", "C3"),
@@ -62,6 +65,7 @@ DEFAULT_ITEMS: List[tuple[str, str]] = [
     ("PREFER_CHANNEL_10", "true"),
     ("AUTO_ELEVATE", "false"),
     ("GUI_TITLE", "SayaTech MIDI 自动弹奏"),
+    ("INPUT_BACKEND", "sendinput"),
 ]
 
 DEFAULT_RAW_MAP: Dict[str, str] = dict(DEFAULT_ITEMS)
@@ -80,6 +84,7 @@ class FieldSpec:
 
 
 SUPPORTED_FIELDS: List[FieldSpec] = [
+    FieldSpec("INSTRUMENT_MODE", "乐器模式", "choice", "音域与键位", "选择当前乐器档案。贝斯会使用独立的起始页和区间约束。", ["钢琴", "吉他", "贝斯"]),
     FieldSpec("LEFTMOST_NOTE", "基础窗口起点", "note", "音域与键位", "基础窗口最左边对应的音名。通常设成你当前页最左边那个白键，例如 C3。"),
     FieldSpec("VISIBLE_OCTAVES", "窗口八度数", "int", "音域与键位", "当前一页横向能覆盖多少个八度。3 代表 36 键布局。"),
     FieldSpec("UNLOCKED_MIN_NOTE", "可弹最低音", "note", "音域与键位", "你在游戏里已经解锁并且能实际弹到的最低音。"),
@@ -94,7 +99,7 @@ SUPPORTED_FIELDS: List[FieldSpec] = [
     FieldSpec("MIN_NOTE_LEN", "最短按键时长", "float", "演奏与切区", "单个音至少按住多久。太短容易吞音，默认 0.15 秒更稳。"),
     FieldSpec("RETRIGGER_MODE", "同键重新起音", "bool", "重触发与踏板", "同一个键还没松开时再次遇到同键音，会先抬再按，保证重新起音。"),
     FieldSpec("RETRIGGER_PRIORITY", "重叠音释放策略", "choice", "重触发与踏板", "latest 表示按到最后出现的那层，first 表示优先保留第一次的结束时长。", ["latest", "first"]),
-    FieldSpec("RETRIGGER_GAP", "同键重按间隔", "float", "重触发与踏板", "同键抬起后再次按下前等待多久。太小可能吞音，太大又会发虚。"),
+    FieldSpec("RETRIGGER_GAP", "同键重按间隔", "float", "重触发与踏板", "同键抬起后再次按下前等待多久。值越小反应越快，但某些游戏里过短会吞音。"),
     FieldSpec("USE_PEDAL", "启用踏板识别", "bool", "重触发与踏板", "读取 MIDI 踏板并用空格键模拟。钢琴曲常用，没踏板的歌关不关都行。"),
     FieldSpec("PEDAL_ON_VALUE", "踏板触发阈值", "int", "重触发与踏板", "MIDI 踏板值高于这个阈值时视为踩下。常见默认是 64。"),
     FieldSpec("PEDAL_TAP_TIME", "踏板点按时长", "float", "重触发与踏板", "模拟空格踏板时，每次点按保持多久。"),
@@ -118,6 +123,8 @@ SUPPORTED_FIELDS: List[FieldSpec] = [
     FieldSpec("SHIFT_HOLD_RELEASE_DELAY", "低音延迟释放", "float", "低音层保留", "切区后低音层延迟多久再抬起。太长会糊，太短又听不出层次。"),
     FieldSpec("OCTAVE_AVOID_COLLISION", "启用防撞", "bool", "高级模式", "尝试避免折返后与邻近音域撞到同一个键位。一般只在特殊曲子里再开。"),
     FieldSpec("OCTAVE_PREVIEW_NEIGHBORS", "邻近预览数量", "int", "高级模式", "看后面多少个邻近音来辅助防撞判断。0 代表关闭。"),
+    FieldSpec("HIGH_FREQ_COMPAT", "启用高频兼容", "bool", "高级模式", "遇到高密度音符时，允许提前抬起按键来换取更稳定的重新触发。默认关闭，只有你确认游戏会吞短间隔连点时再开。"),
+    FieldSpec("HIGH_FREQ_RELEASE_ADVANCE", "高频兼容提前抬起", "float", "高级模式", "把原本的抬键时间整体提前多少秒。0 代表关闭；例如 0.018 表示提前 18ms 抬起。"),
 ]
 
 FIELD_MAP = {spec.key: spec for spec in SUPPORTED_FIELDS}
@@ -126,7 +133,7 @@ BOOL_FIELDS = {
     "USE_CONTEXT_REPLACE", "USE_VELOCITY_RULES", "USE_SMART_KEEP", "PREFER_CHANNEL_10",
     "RETRIGGER_MODE", "AUTO_SHIFT_FROM_RANGE", "AUTO_TRANSPOSE", "USE_PEDAL", "USE_SHIFT_OCTAVE",
     "CHORD_PRIORITY", "OCTAVE_FOLD_PRIORITY", "BAR_AWARE_TRANSPOSE", "SHIFT_HOLD_BASS", "SHIFT_HOLD_CONFLICT_CLEAR",
-    "MELODY_PRIORITY", "OCTAVE_AVOID_COLLISION", "AUTO_ELEVATE",
+    "MELODY_PRIORITY", "OCTAVE_AVOID_COLLISION", "HIGH_FREQ_COMPAT", "AUTO_ELEVATE",
 }
 INT_FIELDS = {
     "ACCENT_VELOCITY", "GHOST_VELOCITY", "VISIBLE_OCTAVES", "PEDAL_ON_VALUE", "LOOKAHEAD_NOTES", "SWITCH_MARGIN",
@@ -135,7 +142,7 @@ INT_FIELDS = {
 }
 FLOAT_FIELDS = {
     "BASE_TAP_HOLD", "SAME_TIME_WINDOW", "DENSITY_LIMIT_HZ", "COARSE_GROUP_WINDOW", "START_DELAY", "MIN_NOTE_LEN",
-    "RETRIGGER_GAP", "PEDAL_TAP_TIME", "SHIFT_WEIGHT", "CHORD_SPLIT_THRESHOLD", "OCTAVE_FOLD_WEIGHT",
+    "RETRIGGER_GAP", "HIGH_FREQ_RELEASE_ADVANCE", "PEDAL_TAP_TIME", "SHIFT_WEIGHT", "CHORD_SPLIT_THRESHOLD", "OCTAVE_FOLD_WEIGHT",
     "SHIFT_HOLD_RELEASE_DELAY", "MELODY_PITCH_WEIGHT", "MELODY_DURATION_WEIGHT", "MELODY_CONTINUITY_WEIGHT",
 }
 LIST_FIELDS = {"KEYMAP"}
