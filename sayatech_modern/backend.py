@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import bisect
+import ctypes
+import os
 import time
 import threading
 from collections import Counter
@@ -16,6 +19,147 @@ try:  # pragma: no cover - runtime dependency on Windows host
     _keylib.PAUSE = 0.0
 except Exception:  # pragma: no cover - CI / non-Windows fallback
     _keylib = None
+
+
+IS_WINDOWS = os.name == "nt"
+INPUT_BACKEND_DEFAULT = "sendinput"
+
+
+if IS_WINDOWS:
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", ctypes.c_ushort),
+            ("wScan", ctypes.c_ushort),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.c_void_p),
+        ]
+
+
+    class _INPUTUNION(ctypes.Union):
+        _fields_ = [("ki", _KEYBDINPUT)]
+
+
+    class _INPUT(ctypes.Structure):
+        _anonymous_ = ("u",)
+        _fields_ = [("type", ctypes.c_ulong), ("u", _INPUTUNION)]
+else:
+    _KEYBDINPUT = None
+    _INPUTUNION = None
+    _INPUT = None
+
+
+class _NoopKeyInjector:
+    label = "noop"
+
+    def key_down(self, _key: str) -> None:
+        return
+
+    def key_up(self, _key: str) -> None:
+        return
+
+
+class _PyDirectInputInjector:
+    label = "pydirectinput"
+
+    def __init__(self, keylib):
+        self._keylib = keylib
+
+    def key_down(self, key: str) -> None:
+        self._keylib.keyDown(key.lower())
+
+    def key_up(self, key: str) -> None:
+        self._keylib.keyUp(key.lower())
+
+
+class _SendInputInjector:
+    label = "SendInput（扫描码）"
+    _KEYEVENTF_KEYUP = 0x0002
+    _KEYEVENTF_SCANCODE = 0x0008
+    _KEYEVENTF_EXTENDEDKEY = 0x0001
+    _INPUT_KEYBOARD = 1
+    _SCANCODE_MAP = {
+        "1": 0x02, "2": 0x03, "3": 0x04, "4": 0x05, "5": 0x06,
+        "6": 0x07, "7": 0x08, "8": 0x09, "9": 0x0A, "0": 0x0B,
+        "q": 0x10, "w": 0x11, "e": 0x12, "r": 0x13, "t": 0x14,
+        "y": 0x15, "u": 0x16, "i": 0x17, "o": 0x18, "p": 0x19,
+        "[": 0x1A, "]": 0x1B,
+        "a": 0x1E, "s": 0x1F, "d": 0x20, "f": 0x21, "g": 0x22,
+        "h": 0x23, "j": 0x24, "k": 0x25, "l": 0x26,
+        ";": 0x27, "'": 0x28,
+        "z": 0x2C, "x": 0x2D, "c": 0x2E, "v": 0x2F, "b": 0x30,
+        "n": 0x31, "m": 0x32, ",": 0x33, ".": 0x34, "/": 0x35,
+        "space": 0x39, " ": 0x39,
+        "comma": 0x33, "period": 0x34,
+        "minus": 0x0C, "-": 0x0C,
+        "equal": 0x0D, "equals": 0x0D, "=": 0x0D,
+        "backslash": 0x2B, "\\": 0x2B,
+        "grave": 0x29, "`": 0x29,
+        "tab": 0x0F, "enter": 0x1C, "return": 0x1C, "esc": 0x01, "escape": 0x01,
+        "shift": 0x2A, "shiftleft": 0x2A,
+        "ctrl": 0x1D, "control": 0x1D, "ctrlleft": 0x1D, "controlleft": 0x1D,
+    }
+    _EXTENDED_SCANCODES = set()
+
+    def __init__(self, fallback=None):
+        self._fallback = fallback
+        # Use a dedicated WinDLL binding here instead of mutating
+        # ctypes.windll.user32.SendInput globally. pydirectinput also binds
+        # SendInput with its own ctypes INPUT structure, and changing the
+        # global argtypes causes its fallback path to crash on Python 3.14.
+        self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self._send_input = self._user32.SendInput
+        self._send_input.argtypes = (ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int)
+        self._send_input.restype = ctypes.c_uint
+
+    @classmethod
+    def _normalize_key(cls, key: str) -> str:
+        return str(key or "").strip().lower()
+
+    @classmethod
+    def _resolve_scancode(cls, key: str):
+        key_name = cls._normalize_key(key)
+        return cls._SCANCODE_MAP.get(key_name)
+
+    def _dispatch(self, key: str, is_key_up: bool) -> None:
+        scancode = self._resolve_scancode(key)
+        if scancode is None:
+            if self._fallback is not None:
+                if is_key_up:
+                    self._fallback.key_up(key)
+                else:
+                    self._fallback.key_down(key)
+            return
+        flags = self._KEYEVENTF_SCANCODE
+        if scancode in self._EXTENDED_SCANCODES:
+            flags |= self._KEYEVENTF_EXTENDEDKEY
+        if is_key_up:
+            flags |= self._KEYEVENTF_KEYUP
+        payload = _INPUT(type=self._INPUT_KEYBOARD, ki=_KEYBDINPUT(0, scancode, flags, 0, None))
+        sent = int(self._send_input(1, ctypes.byref(payload), ctypes.sizeof(_INPUT)))
+        if sent == 0 and self._fallback is not None:
+            if is_key_up:
+                self._fallback.key_up(key)
+            else:
+                self._fallback.key_down(key)
+
+    def key_down(self, key: str) -> None:
+        self._dispatch(key, False)
+
+    def key_up(self, key: str) -> None:
+        self._dispatch(key, True)
+
+
+def _build_key_injector(preferred_backend: str):
+    requested = str(preferred_backend or INPUT_BACKEND_DEFAULT).strip().lower()
+    fallback = _PyDirectInputInjector(_keylib) if _keylib is not None else _NoopKeyInjector()
+    if not IS_WINDOWS:
+        return fallback if _keylib is not None else _NoopKeyInjector()
+    if requested in {"pydirectinput", "pdi", "py"}:
+        return fallback
+    if requested in {"none", "noop", "off"}:
+        return _NoopKeyInjector()
+    return _SendInputInjector(fallback=fallback)
 
 
 DEFAULT_KEYMAP = [
@@ -41,6 +185,7 @@ class BackendPlaybackHandle:
     current_sec: float = 0.0
     worker: Optional[threading.Thread] = None
     stop_event: threading.Event = field(default_factory=threading.Event)
+    run_id: int = 0
     is_running: bool = False
     pressed_keys: set[str] = field(default_factory=set)
     nav_offset: int = 0
@@ -52,12 +197,15 @@ class BackendPlaybackHandle:
 class PlaybackBackend:
     def __init__(self, log_callback: Optional[Callable[[str], None]] = None):
         self.log_callback = log_callback
+        self._input_backend_requested = INPUT_BACKEND_DEFAULT
+        self._key_injector = _build_key_injector(self._input_backend_requested)
 
-    def _log(self, text: str) -> None:
+    def _log(self, text: str, *, debug: bool = False) -> None:
+        tagged = f"[DEBUG] {text}" if debug else text
         if self.log_callback:
-            self.log_callback(text)
+            self.log_callback(tagged)
         else:
-            append_runtime_log(text)
+            append_runtime_log(text, debug=debug)
 
     def prepare(self, analysis: MidiAnalysisResult) -> BackendPlaybackHandle:
         return BackendPlaybackHandle(duration_sec=analysis.duration_sec, current_sec=0.0)
@@ -79,16 +227,33 @@ class PlaybackBackend:
         handle.current_sec = max(0.0, min(position_sec, handle.duration_sec))
 
 
+    def configure_input_backend(self, backend_name: Optional[str]) -> bool:
+        requested = str(backend_name or INPUT_BACKEND_DEFAULT).strip().lower()
+        if requested == self._input_backend_requested and getattr(self, '_key_injector', None) is not None:
+            return False
+        self._input_backend_requested = requested
+        self._key_injector = _build_key_injector(requested)
+        return True
+
+    def input_backend_label(self) -> str:
+        injector = getattr(self, '_key_injector', None)
+        if injector is None:
+            return '未初始化'
+        return getattr(injector, 'label', injector.__class__.__name__)
+
+
 class KeyboardMixin:
     def _key_down(self, key: str) -> None:
-        if _keylib is None:
+        injector = getattr(self, '_key_injector', None)
+        if injector is None:
             return
-        _keylib.keyDown(key.lower())
+        injector.key_down(key)
 
     def _key_up(self, key: str) -> None:
-        if _keylib is None:
+        injector = getattr(self, '_key_injector', None)
+        if injector is None:
             return
-        _keylib.keyUp(key.lower())
+        injector.key_up(key)
 
     def _tap(self, key: str, hold: float) -> None:
         self._key_down(key)
@@ -114,28 +279,49 @@ class LiveBackendBase(PlaybackBackend, KeyboardMixin):
         super().__init__(log_callback=log_callback)
         self.analysis: Optional[MidiAnalysisResult] = None
         self._warned_no_keylib = False
+        self._reported_input_backend = False
 
     def prepare(self, analysis: MidiAnalysisResult) -> BackendPlaybackHandle:
         self.analysis = analysis
         return BackendPlaybackHandle(duration_sec=analysis.duration_sec, current_sec=0.0)
 
     def _ensure_runtime_warning(self) -> None:
-        if _keylib is None and not self._warned_no_keylib:
+        backend_label = self.input_backend_label()
+        if not self._reported_input_backend:
+            self._reported_input_backend = True
+            self._log(f"当前按键注入后端：{backend_label}", debug=True)
+        if backend_label == 'noop' and not self._warned_no_keylib:
             self._warned_no_keylib = True
-            self._log("未检测到 pydirectinput，当前环境只会模拟播放进度，不会真实按键注入。")
+            self._log("当前环境没有可用的按键注入后端，只会模拟播放进度，不会真实按键注入。")
+
+    @staticmethod
+    def _is_current_run(handle: BackendPlaybackHandle, stop_event: threading.Event, run_id: int) -> bool:
+        return handle.run_id == run_id and handle.stop_event is stop_event
+
+    def _finish_run(self, handle: BackendPlaybackHandle, stop_event: threading.Event, run_id: int, *, release_all: bool = True) -> None:
+        if not self._is_current_run(handle, stop_event, run_id):
+            return
+        if release_all:
+            self._release_all(handle)
+            self._set_pedal_state(handle, False)
+        handle.is_running = False
+        if handle.worker and handle.worker.ident == threading.get_ident():
+            handle.worker = None
 
     def _interrupt_worker(self, handle: BackendPlaybackHandle) -> None:
-        if handle.worker and handle.worker.is_alive():
-            self._log(f'请求停止旧播放线程: {handle.worker.name}')
-            handle.stop_event.set()
-            handle.worker.join(timeout=1.2)
-            if handle.worker.is_alive():
-                self._log(f'警告：旧播放线程在 1.2s 内未完全退出: {handle.worker.name}')
+        worker = handle.worker
+        stop_event = handle.stop_event
+        if worker and worker.is_alive():
+            self._log(f'请求停止旧播放线程: {worker.name}', debug=True)
+            stop_event.set()
+            worker.join(timeout=0.25)
+            if worker.is_alive():
+                self._log(f'提示：旧播放线程仍在收尾，已跳过阻塞等待: {worker.name}', debug=True)
             else:
-                self._log(f'旧播放线程已退出: {handle.worker.name}')
+                self._log(f'旧播放线程已退出: {worker.name}', debug=True)
         handle.is_running = False
-        handle.worker = None
-        handle.stop_event = threading.Event()
+        if handle.worker is worker and (worker is None or not worker.is_alive()):
+            handle.worker = None
         self._release_all(handle)
         self._set_pedal_state(handle, False)
 
@@ -143,11 +329,19 @@ class LiveBackendBase(PlaybackBackend, KeyboardMixin):
         self._ensure_runtime_warning()
         handle.current_sec = max(0.0, min(position_sec, handle.duration_sec))
         self._interrupt_worker(handle)
-        handle.stop_event = threading.Event()
+        stop_event = threading.Event()
+        handle.stop_event = stop_event
+        handle.run_id += 1
+        run_id = handle.run_id
         handle.is_running = True
-        worker = threading.Thread(target=self._run_from_position, args=(handle, handle.current_sec), daemon=True, name=f"{self.__class__.__name__}-worker")
+        worker = threading.Thread(
+            target=self._run_from_position,
+            args=(handle, handle.current_sec, stop_event, run_id),
+            daemon=True,
+            name=f"{self.__class__.__name__}-worker",
+        )
         handle.worker = worker
-        self._log(f'启动播放线程 {worker.name} | 起点 {handle.current_sec:.3f}s')
+        self._log(f'启动播放线程 {worker.name} | 起点 {handle.current_sec:.3f}s | run_id={run_id}', debug=True)
         worker.start()
 
     def pause(self, handle: BackendPlaybackHandle, position_sec: float) -> None:
@@ -165,16 +359,36 @@ class LiveBackendBase(PlaybackBackend, KeyboardMixin):
             self.start(handle, handle.current_sec)
 
     def update_config(self, config: dict) -> None:
+        if self.configure_input_backend(config.get("INPUT_BACKEND", INPUT_BACKEND_DEFAULT)):
+            self._reported_input_backend = False
+            self._warned_no_keylib = False
         self.keymap = list(config.get("KEYMAP", DEFAULT_KEYMAP)) or list(DEFAULT_KEYMAP)
+        raw_mode = str(config.get("INSTRUMENT_MODE", "钢琴")).strip().lower()
+        if raw_mode in {"bass", "贝斯"}:
+            self.instrument_mode = "bass"
+        elif raw_mode in {"guitar", "吉他"}:
+            self.instrument_mode = "guitar"
+        else:
+            self.instrument_mode = "piano"
         self.base_leftmost = int(config.get("LEFTMOST_NOTE", DEFAULT_LEFTMOST))
         self.visible_octaves = max(1, int(config.get("VISIBLE_OCTAVES", 3)))
-        self.window_size = max(1, min(len(self.keymap), self.visible_octaves * 12))
-        self.window_rightmost = self.base_leftmost + self.window_size - 1
         self.overall_min_note = int(config.get("UNLOCKED_MIN_NOTE", DEFAULT_OVERALL_MIN))
         self.overall_max_note = int(config.get("UNLOCKED_MAX_NOTE", DEFAULT_OVERALL_MAX))
+        if self.instrument_mode == "bass":
+            self.base_leftmost = 12  # C0，对应贝斯初始页左边界
+            self.visible_octaves = 3
+            self.min_window_offset = 0
+            self.max_window_offset = MAX_WINDOW_OFFSET
+        else:
+            self.min_window_offset = MIN_WINDOW_OFFSET
+            self.max_window_offset = MAX_WINDOW_OFFSET
+        self.window_size = max(1, min(len(self.keymap), self.visible_octaves * 12))
+        self.window_rightmost = self.base_leftmost + self.window_size - 1
         self.auto_transpose = bool(config.get("AUTO_TRANSPOSE", True))
         self.use_pedal = bool(config.get("USE_PEDAL", True))
         self.min_note_len = max(0.01, float(config.get("MIN_NOTE_LEN", self.min_note_len)))
+        self.high_freq_compat = bool(config.get("HIGH_FREQ_COMPAT", False))
+        self.high_freq_release_advance = max(0.0, float(config.get("HIGH_FREQ_RELEASE_ADVANCE", 0.0)))
         self.use_shift_octave = True
         self.auto_shift_from_range = bool(config.get("AUTO_SHIFT_FROM_RANGE", True))
         self.shift_key = "shift"
@@ -217,10 +431,28 @@ class LiveBackendBase(PlaybackBackend, KeyboardMixin):
         self.melody_duration_weight = float(config.get("MELODY_DURATION_WEIGHT", 0.7))
         self.melody_continuity_weight = float(config.get("MELODY_CONTINUITY_WEIGHT", 1.2))
         self.melody_keep_top = max(1, int(config.get("MELODY_KEEP_TOP", 2)))
-        if self.analysis is not None:
-            self._prime_action_cache()
+        new_signature = (
+            self.instrument_mode, self.base_leftmost, self.visible_octaves, self.overall_min_note, self.overall_max_note,
+            self.auto_transpose, self.use_pedal, self.use_shift_octave, self.auto_shift_from_range,
+            self.switch_margin, self.min_notes_between_switches, self.shift_weight, self.retrigger_gap,
+            self.retrigger_mode, self.retrigger_priority, self.lookahead_groups, self.pedal_tap_time,
+            self.high_freq_compat, self.high_freq_release_advance,
+            self.chord_priority, self.chord_split_threshold, self.octave_fold_priority, self.octave_fold_weight,
+            self.max_melodic_jump_after_fold, self.bar_aware_transpose, self.bar_transpose_scope,
+            self.bar_transpose_threshold, self.shift_hold_bass, self.shift_hold_max_note,
+            self.shift_hold_max_chord_rank, self.shift_hold_conflict_clear, self.shift_hold_release_delay,
+            self.octave_avoid_collision, self.octave_preview_neighbors, self.melody_priority,
+            self.melody_pitch_weight, self.melody_duration_weight, self.melody_continuity_weight, self.melody_keep_top,
+        )
+        if self._config_signature is not None and new_signature != self._config_signature:
+            with self._cache_lock:
+                self._actions_cache = None
+                self._action_times_cache = None
+                self._actions_cache_key = None
+                self._prewarm_target_key = None
+        self._config_signature = new_signature
 
-    def _run_from_position(self, handle: BackendPlaybackHandle, position_sec: float) -> None:
+    def _run_from_position(self, handle: BackendPlaybackHandle, position_sec: float, stop_event: threading.Event, run_id: int) -> None:
         raise NotImplementedError
 
     @staticmethod
@@ -297,7 +529,7 @@ class LiveBackendBase(PlaybackBackend, KeyboardMixin):
             for key_name, fine_mode, coarse_steps in path:
                 self._tap(key_name, 0.010)
                 self._set_handle_window(handle, fine_mode, coarse_steps)
-            self._log("可弹区间已回到默认 C3-B5")
+            self._log(f"可弹区间已回到默认 {self._offset_label(0)}", debug=True)
 
 
 def _note_name(midi_note: int) -> str:
@@ -347,6 +579,8 @@ class ModernPianoBackend(LiveBackendBase):
         self.use_pedal = True
         self.pedal_tap_time = 0.08
         self.min_note_len = 0.10
+        self.high_freq_compat = False
+        self.high_freq_release_advance = 0.0
         self.use_shift_octave = True
         self.auto_shift_from_range = True
         self.shift_key = "shift"
@@ -376,39 +610,152 @@ class ModernPianoBackend(LiveBackendBase):
         self.melody_continuity_weight = 1.2
         self.melody_keep_top = 2
         self.fixed_window_mode = False
+        self.instrument_mode = "piano"
+        self.min_window_offset = MIN_WINDOW_OFFSET
+        self.max_window_offset = MAX_WINDOW_OFFSET
+        self._config_signature = None
         self._actions_cache: Optional[List[PianoAction]] = None
+        self._action_times_cache: Optional[List[float]] = None
+        self._actions_cache_key: Optional[tuple] = None
+        self._prewarm_thread: Optional[threading.Thread] = None
+        self._prewarm_target_key: Optional[tuple] = None
+        self._pending_prewarm: Optional[tuple[tuple, MidiAnalysisResult]] = None
+        self._cache_lock = threading.Lock()
 
     def prepare(self, analysis: MidiAnalysisResult) -> BackendPlaybackHandle:
         handle = super().prepare(analysis)
-        self._prime_action_cache()
+        self._schedule_action_cache_prewarm()
         return handle
 
-    def _prime_action_cache(self) -> None:
-        if not self.analysis:
-            self._actions_cache = None
-            return
-        try:
-            self._actions_cache = self._build_actions(self.analysis.notes, self.analysis.pedal_events)
-        except Exception:
-            self._actions_cache = None
+    def _current_action_cache_key(self) -> Optional[tuple]:
+        if not self.analysis or self._config_signature is None:
+            return None
+        return (id(self.analysis), self._config_signature)
 
-    def _run_from_position(self, handle: BackendPlaybackHandle, position_sec: float) -> None:
+    def _get_cached_actions(self) -> Optional[List[PianoAction]]:
+        cache_key = self._current_action_cache_key()
+        with self._cache_lock:
+            if cache_key is not None and cache_key == self._actions_cache_key and self._actions_cache is not None:
+                return self._actions_cache
+        return None
+
+    def _get_cached_action_times(self) -> Optional[List[float]]:
+        cache_key = self._current_action_cache_key()
+        with self._cache_lock:
+            if cache_key is not None and cache_key == self._actions_cache_key and self._action_times_cache is not None:
+                return self._action_times_cache
+        return None
+
+    @classmethod
+    def build_prefetched_actions(cls, analysis: MidiAnalysisResult, config: dict) -> tuple[tuple | None, List[PianoAction]]:
+        backend = cls()
+        backend.update_config(dict(config))
+        backend.analysis = analysis
+        actions = backend._build_actions(analysis.notes, analysis.pedal_events)
+        return backend._current_action_cache_key(), actions
+
+    def import_prefetched_actions(self, analysis: MidiAnalysisResult, cache_key: tuple | None, actions: Sequence[PianoAction]) -> bool:
+        if cache_key is None or self._config_signature is None:
+            return False
+        expected_key = (id(analysis), self._config_signature)
+        if cache_key != expected_key:
+            return False
+        with self._cache_lock:
+            self._actions_cache = list(actions)
+            self._action_times_cache = [a.t for a in actions]
+            self._actions_cache_key = expected_key
+            if self._prewarm_target_key == expected_key:
+                self._prewarm_target_key = None
+            if self._pending_prewarm is not None and self._pending_prewarm[0] == expected_key:
+                self._pending_prewarm = None
+        return True
+
+    def _ensure_action_cache(self) -> List[PianoAction]:
+        cache_key = self._current_action_cache_key()
+        cached = self._get_cached_actions()
+        if cached is not None:
+            return cached
+        if not self.analysis:
+            return []
+        actions = self._build_actions(self.analysis.notes, self.analysis.pedal_events)
+        with self._cache_lock:
+            if cache_key is not None and cache_key == self._current_action_cache_key():
+                self._actions_cache = actions
+                self._action_times_cache = [a.t for a in actions]
+                self._actions_cache_key = cache_key
+        return actions
+
+    def _schedule_action_cache_prewarm(self) -> None:
+        cache_key = self._current_action_cache_key()
+        analysis = self.analysis
+        if cache_key is None or analysis is None:
+            with self._cache_lock:
+                self._actions_cache = None
+                self._action_times_cache = None
+                self._actions_cache_key = None
+                self._prewarm_target_key = None
+                self._pending_prewarm = None
+            return
+        launch_thread = False
+        with self._cache_lock:
+            if self._actions_cache_key == cache_key and self._actions_cache is not None:
+                return
+            self._pending_prewarm = (cache_key, analysis)
+            if self._prewarm_thread is None or not self._prewarm_thread.is_alive():
+                launch_thread = True
+        if not launch_thread:
+            return
+
+        def worker() -> None:
+            while True:
+                with self._cache_lock:
+                    pending = self._pending_prewarm
+                    self._pending_prewarm = None
+                    if pending is None:
+                        self._prewarm_thread = None
+                        return
+                    target_key, analysis_obj = pending
+                    self._prewarm_target_key = target_key
+                try:
+                    actions = self._build_actions(analysis_obj.notes, analysis_obj.pedal_events)
+                    action_times = [a.t for a in actions]
+                except Exception:
+                    with self._cache_lock:
+                        if self._prewarm_target_key == target_key:
+                            self._prewarm_target_key = None
+                    continue
+                with self._cache_lock:
+                    if self._current_action_cache_key() == target_key:
+                        self._actions_cache = actions
+                        self._action_times_cache = action_times
+                        self._actions_cache_key = target_key
+                    if self._prewarm_target_key == target_key:
+                        self._prewarm_target_key = None
+
+        thread = threading.Thread(target=worker, daemon=True, name='PianoActionPrewarm')
+        with self._cache_lock:
+            self._prewarm_thread = thread
+        thread.start()
+
+    def _run_from_position(self, handle: BackendPlaybackHandle, position_sec: float, stop_event: threading.Event, run_id: int) -> None:
         if not self.analysis:
             return
-        actions = list(self._actions_cache) if self._actions_cache is not None else self._build_actions(self.analysis.notes, self.analysis.pedal_events)
+        actions = self._ensure_action_cache()
         if not actions:
             return
+        action_times = self._get_cached_action_times() or [a.t for a in actions]
 
         start_offset = self._offset_at_position(actions, position_sec)
         start_pedal = self._pedal_at_position(actions, position_sec)
         if handle.nav_offset != start_offset:
             self._release_all(handle)
             self._move_handle_to_offset(handle, start_offset, self.nav_tap_hold)
-            self._log(f"切换可弹区间到 {self._offset_label(handle.nav_offset)}，从 {position_sec:.2f}s 开始。")
+            self._log(f"切换可弹区间到 {self._offset_label(handle.nav_offset)}，从 {position_sec:.2f}s 开始。", debug=True)
         if self.use_pedal:
             self._set_pedal_state(handle, start_pedal, self.pedal_tap_time)
 
-        actions = [a for a in actions if a.t >= max(0.0, position_sec - 0.01)]
+        start_index = bisect.bisect_left(action_times, max(0.0, position_sec - 0.01))
+        actions = actions[start_index:]
         if not actions:
             return
 
@@ -433,18 +780,20 @@ class ModernPianoBackend(LiveBackendBase):
                     held_keys.pop(key, None)
 
         try:
+            self._log(f"钢琴/吉他/贝斯开始播放：{position_sec:.3f}s")
             self._log(
                 f"钢琴/吉他/贝斯播放开始 | 起点={position_sec:.3f}s | 音符={len(self.analysis.notes) if self.analysis else 0} | 动作={len(actions)} | "
                 f"keymap={len(self.keymap)} | 窗口={self.base_leftmost}-{self.window_rightmost} | "
                 f"整体范围={self.overall_min_note}-{self.overall_max_note} | shift={self.use_shift_octave} | "
-                f"auto_shift={self.auto_shift_from_range} | fixed_window={self.fixed_window_mode} | pedal={self.use_pedal}"
+                f"auto_shift={self.auto_shift_from_range} | fixed_window={self.fixed_window_mode} | pedal={self.use_pedal}",
+                debug=True,
             )
             for action in actions:
-                if handle.stop_event.is_set():
+                if stop_event.is_set():
                     break
                 delay = max(0.0, action.t - anchor)
                 target_perf = start_perf + delay
-                if not self._sleep_until(target_perf, handle.stop_event):
+                if not self._sleep_until(target_perf, stop_event):
                     break
                 release_expired_holds()
 
@@ -474,9 +823,9 @@ class ModernPianoBackend(LiveBackendBase):
                     if now - last_nav_log_at > 0.05:
                         last_nav_log_at = now
                         if holdable_keys:
-                            self._log(f"可弹区间 -> {action.label} | 保留低音 {', '.join(sorted(holdable_keys))}")
+                            self._log(f"可弹区间 -> {action.label} | 保留低音 {', '.join(sorted(holdable_keys))}", debug=True)
                         else:
-                            self._log(f"可弹区间 -> {action.label}")
+                            self._log(f"可弹区间 -> {action.label}", debug=True)
                     continue
                 if action.kind == "pedal":
                     if self.use_pedal:
@@ -573,11 +922,10 @@ class ModernPianoBackend(LiveBackendBase):
             self._log(f'钢琴/吉他/贝斯播放线程异常，已写入崩溃日志: {path}')
             raise
         finally:
-            release_expired_holds(force=True)
-            self._release_all(handle)
-            self._set_pedal_state(handle, False, self.pedal_tap_time)
-            handle.is_running = False
-            self._log('钢琴/吉他/贝斯播放线程结束。')
+            if self._is_current_run(handle, stop_event, run_id):
+                release_expired_holds(force=True)
+                self._finish_run(handle, stop_event, run_id)
+            self._log('钢琴/吉他/贝斯播放线程结束。', debug=True)
 
     def _build_actions(self, notes: Sequence[NoteSpan], pedal_events: Sequence[PedalEvent]) -> List[PianoAction]:
         if not notes:
@@ -634,7 +982,14 @@ class ModernPianoBackend(LiveBackendBase):
                 key = self.keymap[key_index]
                 chord_rank = low_rank_map.get(id(note), 0)
                 actions.append(PianoAction(t=note.start_sec, kind="down", key=key, target_offset=current_offset, note_token=note_token, midi_note=note.midi_note, chord_rank=chord_rank))
-                actions.append(PianoAction(t=max(note.end_sec, note.start_sec + self.min_note_len), kind="up", key=key, target_offset=current_offset, note_token=note_token, midi_note=note.midi_note, chord_rank=chord_rank))
+                release_advance = self.high_freq_release_advance if self.high_freq_compat else 0.0
+                if bool(getattr(note, 'closed_by_next_same_note_on', False)):
+                    edge_end_sec = float(note.end_sec)
+                    release_at = min(edge_end_sec, max(note.start_sec + 0.003, edge_end_sec - release_advance))
+                else:
+                    effective_min_len = max(0.003, self.min_note_len - release_advance)
+                    release_at = max(note.end_sec - release_advance, note.start_sec + effective_min_len)
+                actions.append(PianoAction(t=release_at, kind="up", key=key, target_offset=current_offset, note_token=note_token, midi_note=note.midi_note, chord_rank=chord_rank))
                 note_token += 1
             if mapped_melody is not None:
                 prev_melody_note = mapped_melody
@@ -721,7 +1076,7 @@ class ModernPianoBackend(LiveBackendBase):
         if getattr(self, "fixed_window_mode", False):
             return [0]
         offsets: List[int] = []
-        for offset in range(MIN_WINDOW_OFFSET, MAX_WINDOW_OFFSET + 1):
+        for offset in range(self.min_window_offset, self.max_window_offset + 1):
             fine_mode, _coarse = self._offset_to_state(offset)
             if fine_mode == "shift" and not self.use_shift_octave:
                 continue
@@ -1043,6 +1398,9 @@ class ModernDrumBackend(LiveBackendBase):
         self.prefer_channel_10 = True
 
     def update_config(self, config: dict) -> None:
+        if self.configure_input_backend(config.get("INPUT_BACKEND", INPUT_BACKEND_DEFAULT)):
+            self._reported_input_backend = False
+            self._warned_no_keylib = False
         self.retrigger_gap = float(config.get("RETRIGGER_GAP", self.retrigger_gap))
         max_sim = config.get("MAX_SIMULTANEOUS", "none")
         try:
@@ -1132,7 +1490,7 @@ class ModernDrumBackend(LiveBackendBase):
             preview_rows=preview_rows,
         )
 
-    def _run_from_position(self, handle: BackendPlaybackHandle, position_sec: float) -> None:
+    def _run_from_position(self, handle: BackendPlaybackHandle, position_sec: float, stop_event: threading.Event, run_id: int) -> None:
         if not self.analysis:
             return
         hits = self._build_hits(self.analysis.notes)
@@ -1142,12 +1500,13 @@ class ModernDrumBackend(LiveBackendBase):
         start_perf = time.perf_counter()
         anchor = position_sec
         last_status_at = 0.0
+        self._log(f"鼓开始播放：{position_sec:.3f}s")
         try:
             for hit in hits:
-                if handle.stop_event.is_set():
+                if stop_event.is_set():
                     break
                 target_perf = start_perf + max(0.0, hit.t - anchor)
-                if not self._sleep_until(target_perf, handle.stop_event):
+                if not self._sleep_until(target_perf, stop_event):
                     break
                 if hit.key in handle.pressed_keys:
                     self._key_up(hit.key)
@@ -1164,10 +1523,9 @@ class ModernDrumBackend(LiveBackendBase):
                     last_status_at = now
                     name = self.KEY_NAMES.get(hit.key, hit.key)
                     suffix = f" | {hit.reason}" if hit.reason and hit.reason != "直接映射" else ""
-                    self._log(f"鼓命中：{hit.key}  {name}  力度={hit.velocity}{suffix}")
+                    self._log(f"鼓命中：{hit.key}  {name}  力度={hit.velocity}{suffix}", debug=True)
         finally:
-            self._release_all(handle)
-            handle.is_running = False
+            self._finish_run(handle, stop_event, run_id)
 
     def _build_hits(self, notes: Sequence[NoteSpan]) -> List[DrumHit]:
         if not notes:
