@@ -23,6 +23,11 @@ class NoteSpan:
     end_sec: float
     midi_note: int
     velocity: int
+    channel: int = 0
+    raw_duration_sec: float = 0.0
+    raw_end_sec: float = 0.0
+    has_raw_note_off: bool = False
+    closed_by_next_same_note_on: bool = False
 
 
 @dataclass(slots=True)
@@ -49,8 +54,21 @@ class MidiAnalysisResult:
     duration_sec: float
     min_note: int
     max_note: int
+    shortest_note_sec: float = 0.0
+    shortest_raw_same_key_gap_sec: float = 0.0
+    shortest_retrigger_gap_sec: float = 0.0
     primary_bpm: float = 120.0
     has_tempo_changes: bool = False
+    timeline_bins: int = 96
+    notes_by_track: dict[int, tuple[NoteSpan, ...]] = field(default_factory=dict, repr=False)
+    pedal_events_by_track: dict[int, tuple[PedalEvent, ...]] = field(default_factory=dict, repr=False)
+    track_timeline_raw_bars: dict[int, tuple[float, ...]] = field(default_factory=dict, repr=False)
+    source_analysis_id: Optional[int] = field(default=None, repr=False)
+    selected_track_indexes_key: tuple[int, ...] = field(default_factory=tuple, repr=False)
+
+    @property
+    def shortest_retrigger_gap_display_sec(self) -> float:
+        return float(self.shortest_raw_same_key_gap_sec or self.shortest_retrigger_gap_sec or 0.0)
 
     @property
     def recommended_track_indexes(self) -> List[int]:
