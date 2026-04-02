@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import html
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .backend import ModernPianoBackend
@@ -8,6 +12,7 @@ from .config_io import midi_to_note_name
 from .models import MidiAnalysisResult, NoteSpan
 
 PREVIEW_LABELS: List[Tuple[str, str]] = [
+    ("INSTRUMENT_MODE", "乐器模式"),
     ("LEFTMOST_NOTE", "基础窗口起点"),
     ("VISIBLE_OCTAVES", "窗口八度数"),
     ("UNLOCKED_MIN_NOTE", "可弹最低音"),
@@ -23,10 +28,60 @@ PREVIEW_LABELS: List[Tuple[str, str]] = [
     ("SHIFT_HOLD_BASS", "保留低音层"),
     ("SHIFT_HOLD_MAX_NOTE", "低音保留上限"),
     ("MIN_NOTE_LEN", "最短按键时长"),
+    ("RETRIGGER_GAP", "同键重按间隔"),
+    ("USE_PEDAL", "启用踏板识别"),
     ("OCTAVE_AVOID_COLLISION", "启用防撞"),
     ("OCTAVE_PREVIEW_NEIGHBORS", "邻近预览数量"),
     ("RETRIGGER_PRIORITY", "重叠音释放策略"),
 ]
+
+DEFAULT_RETRIGGER_GAP = 0.021
+
+
+
+def _format_seconds_compact(value: float) -> str:
+    try:
+        value = float(value)
+    except Exception:
+        return "0 ms"
+    if value <= 0:
+        return "0 ms"
+    if value < 1.0:
+        return f"{value * 1000:.1f} ms"
+    return f"{value:.3f} s"
+
+
+def _html_line(label: str, value: Any, *, bold: bool = False, bullet: bool = True) -> str:
+    label_html = f"<b>{html.escape(str(label))}</b>"
+    value_text = html.escape(str(value))
+    value_html = f"<b>{value_text}</b>" if bold else value_text
+    prefix = "• " if bullet else ""
+    return f"{prefix}{label_html}：{value_html}"
+
+
+def _html_block(lines: List[str]) -> str:
+    return "<div style='white-space:pre-wrap; line-height:1.55;'>" + "<br>".join(lines) + "</div>"
+
+
+_WORKER_TUNER: Optional["MultiCandidateTuner"] = None
+
+
+def _init_tuner_worker(
+    analysis: MidiAnalysisResult,
+    current_config: Dict[str, Any],
+    playable_range: Tuple[int, int],
+) -> None:
+    global _WORKER_TUNER
+    _WORKER_TUNER = MultiCandidateTuner(analysis, current_config, playable_range)
+
+
+def _score_candidate_worker(payload: Tuple[Dict[str, Any], bool, Optional[float]]) -> Tuple[float, Dict[str, Any]]:
+    tuner = _WORKER_TUNER
+    if tuner is None:
+        raise RuntimeError("自动调参工作进程未正确初始化。")
+    candidate, probe, stop_above = payload
+    return tuner.quick_score(candidate, probe=probe, stop_above=stop_above)
+
 
 
 def _round_left_to_c(note: int) -> int:
@@ -54,6 +109,61 @@ def _safe_bool(current_config: Dict[str, Any], key: str, default: bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _instrument_mode(current_config: Dict[str, Any]) -> str:
+    raw = str(current_config.get("INSTRUMENT_MODE", "钢琴")).strip().lower()
+    if raw in {"bass", "贝斯"}:
+        return "bass"
+    if raw in {"guitar", "吉他"}:
+        return "guitar"
+    return "piano"
+
+
+def _clamp_retrigger_gap(value: float) -> float:
+    return round(max(0.0, float(value)), 3)
+
+
+def _instrument_weights(mode: str) -> Dict[str, float]:
+    if mode == "guitar":
+        return {
+            "lost": 165.0,
+            "melody_loss": 18.0,
+            "fold_base": 6.6,
+            "harsh": 0.65,
+            "collision": 3.2,
+            "switch": 1.8,
+            "duration": 1.15,
+            "retrigger": 1.45,
+            "upper_switch": 1.2,
+            "low_bonus": 0.55,
+        }
+    if mode == "bass":
+        return {
+            "lost": 180.0,
+            "melody_loss": 12.0,
+            "fold_base": 8.0,
+            "harsh": 0.95,
+            "collision": 2.8,
+            "switch": 2.45,
+            "duration": 0.85,
+            "retrigger": 1.0,
+            "upper_switch": 2.8,
+            "low_bonus": 1.15,
+        }
+    return {
+        "lost": 150.0,
+        "melody_loss": 30.0,
+        "fold_base": 7.0,
+        "harsh": 0.85,
+        "collision": 3.6,
+        "switch": 1.0,
+        "duration": 1.0,
+        "retrigger": 1.1,
+        "upper_switch": 1.4,
+        "low_bonus": 1.0,
+    }
+
+
+
 def _group_notes(notes: List[NoteSpan], threshold: float) -> List[List[NoteSpan]]:
     groups: List[List[NoteSpan]] = []
     if not notes:
@@ -72,15 +182,78 @@ def _group_notes(notes: List[NoteSpan], threshold: float) -> List[List[NoteSpan]
     return groups
 
 
+def _has_effective_source_close(note: NoteSpan) -> bool:
+    return bool(getattr(note, "has_raw_note_off", False) or getattr(note, "closed_by_next_same_note_on", False))
+
+
+def _note_raw_duration(note: NoteSpan) -> float:
+    if bool(getattr(note, "has_raw_note_off", False)):
+        return max(0.0, float(getattr(note, "raw_duration_sec", 0.0)))
+    return max(0.0, float(note.end_sec - note.start_sec))
+
+
+def _note_raw_end(note: NoteSpan) -> float:
+    if bool(getattr(note, "has_raw_note_off", False)):
+        return float(getattr(note, "raw_end_sec", 0.0))
+    return float(note.start_sec) + max(0.0, float(note.end_sec - note.start_sec))
+
+
+def _note_runtime_release(note: NoteSpan, backend: ModernPianoBackend) -> float:
+    release_advance = float(getattr(backend, 'high_freq_release_advance', 0.0) or 0.0) if bool(getattr(backend, 'high_freq_compat', False)) else 0.0
+    if bool(getattr(note, 'closed_by_next_same_note_on', False)):
+        edge_end_sec = float(note.end_sec)
+        return min(edge_end_sec, max(float(note.start_sec) + 0.003, edge_end_sec - release_advance))
+    effective_min_len = max(0.003, float(getattr(backend, 'min_note_len', 0.1)) - release_advance)
+    return max(float(note.end_sec) - release_advance, float(note.start_sec) + effective_min_len)
+
+
+def _source_repeat_key(note: NoteSpan) -> tuple[int, int, int]:
+    return (int(note.track_index), int(getattr(note, "channel", 0)), int(note.midi_note))
+
+
+def _has_effective_source_close(note: NoteSpan) -> bool:
+    return bool(getattr(note, "has_raw_note_off", False) or getattr(note, "closed_by_next_same_note_on", False))
+
+
 def _feature_summary(analysis: MidiAnalysisResult, threshold: float) -> Dict[str, Any]:
     notes = analysis.notes
     groups = _group_notes(notes, threshold)
     note_values = [n.midi_note for n in notes] or [60]
-    durations = [max(0.0, n.end_sec - n.start_sec) for n in notes] or [0.1]
+    durations = [_note_raw_duration(n) for n in notes if _has_effective_source_close(n)]
+    if not durations:
+        durations = [max(0.0, float(n.end_sec - n.start_sec)) for n in notes] or [0.1]
     melody = [max(group, key=lambda n: n.midi_note).midi_note for group in groups if group]
     jumps = [abs(melody[i] - melody[i - 1]) for i in range(1, len(melody))]
     short_008 = sum(1 for d in durations if d <= 0.08)
     short_006 = sum(1 for d in durations if d <= 0.06)
+
+    ordered = sorted(notes, key=lambda n: (float(n.start_sec), int(n.track_index), int(getattr(n, "channel", 0)), int(n.midi_note)))
+    repeat_hits = 0
+    last_raw_end_by_key: Dict[tuple[int, int, int], float] = {}
+    has_prev_closed_by_key: Dict[tuple[int, int, int], bool] = {}
+    same_key_gaps: List[float] = []
+    start_times = [float(n.start_sec) for n in ordered]
+    for note in ordered:
+        key = _source_repeat_key(note)
+        last_raw_end = last_raw_end_by_key.get(key)
+        if has_prev_closed_by_key.get(key, False) and last_raw_end is not None:
+            gap = max(0.0, float(note.start_sec) - last_raw_end)
+            same_key_gaps.append(gap)
+            if gap <= 0.12:
+                repeat_hits += 1
+        if _has_effective_source_close(note):
+            last_raw_end_by_key[key] = _note_raw_end(note)
+            has_prev_closed_by_key[key] = True
+        else:
+            has_prev_closed_by_key[key] = False
+
+    burst_max = 0
+    left = 0
+    for right, start in enumerate(start_times):
+        while start - start_times[left] > 0.25:
+            left += 1
+        burst_max = max(burst_max, right - left + 1)
+
     return {
         "note_count": len(notes),
         "min_note": min(note_values),
@@ -94,6 +267,10 @@ def _feature_summary(analysis: MidiAnalysisResult, threshold: float) -> Dict[str
         "avg_duration": sum(durations) / max(1, len(durations)),
         "short_ratio_008": short_008 / max(1, len(durations)),
         "short_ratio_006": short_006 / max(1, len(durations)),
+        "repeat_ratio": repeat_hits / max(1, len(ordered)),
+        "shortest_same_key_gap": min(same_key_gaps) if same_key_gaps else 0.0,
+        "avg_same_key_gap": (sum(same_key_gaps) / len(same_key_gaps)) if same_key_gaps else 0.0,
+        "burst_notes_025": burst_max,
         "groups": groups,
     }
 
@@ -110,6 +287,7 @@ class MultiCandidateTuner:
         self.threshold = _safe_float(current_config, "CHORD_SPLIT_THRESHOLD", 0.05)
         self.feat = _feature_summary(analysis, self.threshold)
         self.groups: List[List[NoteSpan]] = self.feat["groups"]
+        self.section_profile = self._build_section_profile()
         self.backend = ModernPianoBackend()
         self.backend.update_config(self.current_config)
         self.group_note_prefix: List[int] = [0]
@@ -141,6 +319,37 @@ class MultiCandidateTuner:
         if total >= 1200 or self.feat["note_count"] >= 9000:
             target = 120
         return self._build_group_sample(target=target, head_tail=18, top_weighted=36)
+
+
+    def _build_section_profile(self) -> Dict[str, float]:
+        if not self.groups:
+            return {
+                "pressure_spread": 0.0,
+                "max_section_pressure": 0.0,
+                "avg_section_chord": float(self.feat["avg_chord"]),
+                "section_count": 0.0,
+            }
+        total = len(self.groups)
+        cuts = max(1, min(4, total))
+        section_pressures: List[float] = []
+        section_chords: List[float] = []
+        for idx in range(cuts):
+            start = (total * idx) // cuts
+            end = (total * (idx + 1)) // cuts
+            chunk = self.groups[start:end]
+            if not chunk:
+                continue
+            chunk_notes = [n for group in chunk for n in group]
+            pressure = sum(1 for n in chunk_notes if n.midi_note < self.user_min or n.midi_note > self.user_max) / max(1, len(chunk_notes))
+            chord_avg = sum(len(group) for group in chunk) / max(1, len(chunk))
+            section_pressures.append(pressure)
+            section_chords.append(chord_avg)
+        return {
+            "pressure_spread": (max(section_pressures) - min(section_pressures)) if section_pressures else 0.0,
+            "max_section_pressure": max(section_pressures) if section_pressures else 0.0,
+            "avg_section_chord": sum(section_chords) / max(1, len(section_chords)) if section_chords else float(self.feat["avg_chord"]),
+            "section_count": float(len(section_pressures)),
+        }
 
     def _build_group_sample(self, *, target: int, head_tail: int, top_weighted: int) -> List[int]:
         total = len(self.groups)
@@ -217,14 +426,18 @@ class MultiCandidateTuner:
                 "switch_need": 0,
                 "collision_penalty": 0.0,
                 "duration_penalty": 0.0,
+                "retrigger_penalty": 0.0,
                 "low_layer_bonus": 0.0,
                 "sampled_groups": 0,
             }
 
+        mode = _instrument_mode(merged)
+        weights = _instrument_weights(mode)
         allowed_offsets = self.backend._allowed_offsets()
         current_offset = 0 if 0 in allowed_offsets else allowed_offsets[0]
         last_switch_note_index = 0
         prev_melody_note: Optional[int] = None
+        last_key_time: Dict[int, float] = {}
 
         lost = 0
         melody_loss = 0
@@ -233,6 +446,7 @@ class MultiCandidateTuner:
         fold_penalty = 0.0
         switch_need = 0
         duration_penalty = 0.0
+        retrigger_penalty = 0.0
         low_layer_bonus = 0.0
         upper_switches = 0
 
@@ -273,9 +487,19 @@ class MultiCandidateTuner:
                 used_key_indexes.add(key_index)
                 fold_penalty += fold_distance
                 harsh_fold += jump_excess
-                note_duration = max(0.0, note.end_sec - note.start_sec)
+                note_duration = _note_raw_duration(note)
+                runtime_release = _note_runtime_release(note, self.backend)
+                effective_hold = max(0.0, runtime_release - float(note.start_sec))
                 if note_duration < self.backend.min_note_len:
                     duration_penalty += (self.backend.min_note_len - note_duration) * 18.0
+
+                last_release = last_key_time.get(key_index)
+                if last_release is not None:
+                    gap = max(0.0, float(note.start_sec) - last_release)
+                    if gap < float(merged["RETRIGGER_GAP"]):
+                        retrigger_penalty += (float(merged["RETRIGGER_GAP"]) - gap) * 140.0
+                last_key_time[key_index] = runtime_release
+
                 chord_rank = low_rank_map.get(id(note), 0)
                 if self.backend.shift_hold_bass and chord_rank <= self.backend.shift_hold_max_chord_rank and note.midi_note <= self.backend.shift_hold_max_note:
                     group_low_bonus += 0.20 if target_offset > 0 else 0.08
@@ -288,14 +512,16 @@ class MultiCandidateTuner:
 
             if stop_above is not None:
                 partial = (
-                    lost * 150.0
-                    + melody_loss * 30.0
-                    + fold_penalty * (7.0 + float(merged["OCTAVE_FOLD_WEIGHT"]) * 4.0)
-                    + harsh_fold * 0.85
-                    + collision_penalty * 3.6
-                    + switch_need * max(0.35, float(merged["SHIFT_WEIGHT"]) - 0.95)
-                    + duration_penalty
-                    - low_layer_bonus
+                    lost * weights["lost"]
+                    + melody_loss * weights["melody_loss"]
+                    + fold_penalty * (weights["fold_base"] + float(merged["OCTAVE_FOLD_WEIGHT"]) * 4.0)
+                    + harsh_fold * weights["harsh"]
+                    + collision_penalty * weights["collision"]
+                    + switch_need * max(0.35, float(merged["SHIFT_WEIGHT"]) - 0.95) * weights["switch"]
+                    + upper_switches * weights["upper_switch"]
+                    + duration_penalty * weights["duration"]
+                    + retrigger_penalty * weights["retrigger"]
+                    - low_layer_bonus * weights["low_bonus"]
                 )
                 relaxed_cutoff = stop_above * (1.18 if sampled_ratio < 0.999 else 1.04) + 4.0
                 if partial > relaxed_cutoff:
@@ -310,14 +536,16 @@ class MultiCandidateTuner:
             switch_need = 0
 
         score = (
-            lost * 150.0
-            + melody_loss * 30.0
-            + fold_penalty * (7.0 + float(merged["OCTAVE_FOLD_WEIGHT"]) * 4.0)
-            + harsh_fold * 0.85
-            + collision_penalty * 3.6
-            + switch_need * max(0.35, float(merged["SHIFT_WEIGHT"]) - 0.95)
-            + duration_penalty
-            - low_layer_bonus
+            lost * weights["lost"]
+            + melody_loss * weights["melody_loss"]
+            + fold_penalty * (weights["fold_base"] + float(merged["OCTAVE_FOLD_WEIGHT"]) * 4.0)
+            + harsh_fold * weights["harsh"]
+            + collision_penalty * weights["collision"]
+            + switch_need * max(0.35, float(merged["SHIFT_WEIGHT"]) - 0.95) * weights["switch"]
+            + upper_switches * weights["upper_switch"]
+            + duration_penalty * weights["duration"]
+            + retrigger_penalty * weights["retrigger"]
+            - low_layer_bonus * weights["low_bonus"]
         )
         return score, {
             "lost": int(lost),
@@ -327,6 +555,7 @@ class MultiCandidateTuner:
             "upper_switches": int(upper_switches),
             "collision_penalty": round(collision_penalty, 2),
             "duration_penalty": round(duration_penalty, 2),
+            "retrigger_penalty": round(retrigger_penalty, 2),
             "low_layer_bonus": round(low_layer_bonus, 2),
             "sampled_groups": len(group_indexes),
             "fixed_window_mode": fixed_window,
@@ -337,12 +566,19 @@ class MultiCandidateTuner:
         merged.update(cfg)
         merged["UNLOCKED_MIN_NOTE"] = self.user_min
         merged["UNLOCKED_MAX_NOTE"] = self.user_max
+        instrument_mode = _instrument_mode(merged)
+        merged["INSTRUMENT_MODE"] = "贝斯" if instrument_mode == "bass" else ("吉他" if instrument_mode == "guitar" else "钢琴")
         visible_octaves = max(1, int(merged.get("VISIBLE_OCTAVES", 3)))
-        merged["VISIBLE_OCTAVES"] = visible_octaves
-        leftmost = int(merged.get("LEFTMOST_NOTE", self.user_min))
-        leftmost = max(self.user_min, _round_left_to_c(leftmost))
-        max_leftmost = max(self.user_min, self.user_max - visible_octaves * 12 + 1)
-        merged["LEFTMOST_NOTE"] = min(leftmost, max_leftmost)
+        if instrument_mode == "bass":
+            visible_octaves = 3
+            merged["VISIBLE_OCTAVES"] = visible_octaves
+            merged["LEFTMOST_NOTE"] = 12
+        else:
+            merged["VISIBLE_OCTAVES"] = visible_octaves
+            leftmost = int(merged.get("LEFTMOST_NOTE", self.user_min))
+            leftmost = max(self.user_min, _round_left_to_c(leftmost))
+            max_leftmost = max(self.user_min, self.user_max - visible_octaves * 12 + 1)
+            merged["LEFTMOST_NOTE"] = min(leftmost, max_leftmost)
         merged["AUTO_SHIFT_FROM_RANGE"] = bool(merged.get("AUTO_SHIFT_FROM_RANGE", True))
         merged["USE_SHIFT_OCTAVE"] = bool(merged.get("USE_SHIFT_OCTAVE", True))
         right_edge = int(merged["LEFTMOST_NOTE"]) + visible_octaves * 12 - 1
@@ -357,6 +593,7 @@ class MultiCandidateTuner:
         merged["MIN_NOTES_BETWEEN_SWITCHES"] = max(0, int(merged.get("MIN_NOTES_BETWEEN_SWITCHES", 0)))
         merged["LOOKAHEAD_NOTES"] = max(8, int(merged.get("LOOKAHEAD_NOTES", 24)))
         merged["MIN_NOTE_LEN"] = max(0.03, float(merged.get("MIN_NOTE_LEN", 0.1)))
+        merged["RETRIGGER_GAP"] = _clamp_retrigger_gap(float(merged.get("RETRIGGER_GAP", DEFAULT_RETRIGGER_GAP)))
         merged["SHIFT_WEIGHT"] = max(0.1, float(merged.get("SHIFT_WEIGHT", 1.6)))
         merged["OCTAVE_FOLD_WEIGHT"] = max(0.2, float(merged.get("OCTAVE_FOLD_WEIGHT", 0.55)))
         merged["OCTAVE_LOOKAHEAD"] = max(int(merged.get("OCTAVE_LOOKAHEAD", 0)), int(merged["LOOKAHEAD_NOTES"]))
@@ -365,8 +602,12 @@ class MultiCandidateTuner:
     def build_seed(self) -> Dict[str, Any]:
         note_span = self.feat["max_note"] - self.feat["min_note"] + 1
         playable_span = self.user_max - self.user_min + 1
+        instrument_mode = _instrument_mode(self.current_config)
         current_leftmost = _safe_int(self.current_config, "LEFTMOST_NOTE", self.user_min)
         visible_octaves = _safe_int(self.current_config, "VISIBLE_OCTAVES", 3)
+        if instrument_mode == "bass":
+            current_leftmost = 12
+            visible_octaves = 3
         if playable_span < visible_octaves * 12:
             visible_octaves = max(1, min(visible_octaves, max(1, playable_span // 12)))
         window_size = max(12, visible_octaves * 12)
@@ -392,6 +633,8 @@ class MultiCandidateTuner:
         melodic_busy = self.feat["avg_jump"] >= 8 or self.feat["max_jump"] >= 16
         short_ratio_008 = self.feat["short_ratio_008"]
         short_ratio_006 = self.feat["short_ratio_006"]
+        repeat_ratio = self.feat["repeat_ratio"]
+        section_instability = self.section_profile["pressure_spread"] >= 0.18 or self.section_profile["max_section_pressure"] >= 0.24
 
         right_edge = leftmost + window_size - 1
         shift_possible = self.user_max > right_edge
@@ -403,12 +646,25 @@ class MultiCandidateTuner:
         if fixed_window:
             use_shift = False
 
-        if short_ratio_006 >= 0.20:
-            min_note_len = 0.06
-        elif short_ratio_008 >= 0.18 or note_span > playable_span:
-            min_note_len = 0.08
+        if instrument_mode == "guitar":
+            if short_ratio_006 >= 0.16 or repeat_ratio >= 0.08:
+                min_note_len = 0.045
+            elif short_ratio_008 >= 0.18:
+                min_note_len = 0.055
+            else:
+                min_note_len = 0.070
+            retrigger_gap = 0.024 if repeat_ratio >= 0.06 or short_ratio_008 >= 0.15 else 0.028
+        elif instrument_mode == "bass":
+            min_note_len = 0.070 if short_ratio_008 >= 0.14 else 0.090
+            retrigger_gap = 0.026
         else:
-            min_note_len = 0.10
+            if short_ratio_006 >= 0.20:
+                min_note_len = 0.06
+            elif short_ratio_008 >= 0.18 or note_span > playable_span:
+                min_note_len = 0.08
+            else:
+                min_note_len = 0.10
+            retrigger_gap = 0.026 if repeat_ratio >= 0.05 else 0.030
 
         preview_neighbors = 0
         if chord_dense and (high_pressure or melodic_busy):
@@ -417,6 +673,7 @@ class MultiCandidateTuner:
             preview_neighbors = 4
 
         seed: Dict[str, Any] = {
+            "INSTRUMENT_MODE": "贝斯" if instrument_mode == "bass" else ("吉他" if instrument_mode == "guitar" else "钢琴"),
             "LEFTMOST_NOTE": leftmost,
             "VISIBLE_OCTAVES": visible_octaves,
             "UNLOCKED_MIN_NOTE": self.user_min,
@@ -425,14 +682,14 @@ class MultiCandidateTuner:
             "AUTO_SHIFT_FROM_RANGE": auto_shift,
             "USE_SHIFT_OCTAVE": use_shift,
             "USE_PEDAL": any(t.has_pedal for t in self.analysis.track_infos),
-            "LOOKAHEAD_NOTES": lookahead,
-            "SWITCH_MARGIN": switch_margin,
+            "LOOKAHEAD_NOTES": lookahead + (4 if section_instability else 0),
+            "SWITCH_MARGIN": switch_margin + (1 if section_instability and not fixed_window else 0),
             "MIN_NOTES_BETWEEN_SWITCHES": 10 if note_span <= playable_span + 6 else 14,
-            "SHIFT_WEIGHT": shift_weight,
+            "SHIFT_WEIGHT": shift_weight + (0.08 if section_instability else 0.0),
             "MIN_NOTE_LEN": min_note_len,
             "RETRIGGER_MODE": True,
             "RETRIGGER_PRIORITY": "latest" if chord_dense else "first",
-            "RETRIGGER_GAP": 0.003,
+            "RETRIGGER_GAP": retrigger_gap,
             "PEDAL_ON_VALUE": _safe_int(self.current_config, "PEDAL_ON_VALUE", 64),
             "PEDAL_TAP_TIME": _safe_float(self.current_config, "PEDAL_TAP_TIME", 0.08),
             "CHORD_PRIORITY": chord_dense,
@@ -440,8 +697,8 @@ class MultiCandidateTuner:
             "OCTAVE_FOLD_PRIORITY": True,
             "OCTAVE_FOLD_WEIGHT": 0.55 if not high_pressure else 0.68,
             "MAX_MELODIC_JUMP_AFTER_FOLD": 12 if not melodic_busy else 10,
-            "BAR_AWARE_TRANSPOSE": (high_pressure or low_pressure) and not fixed_window,
-            "BAR_TRANSPOSE_SCOPE": "phrase" if note_span <= playable_span + 12 else "halfbar",
+            "BAR_AWARE_TRANSPOSE": ((high_pressure or low_pressure) and not fixed_window) or section_instability,
+            "BAR_TRANSPOSE_SCOPE": "phrase" if section_instability or note_span <= playable_span + 12 else "halfbar",
             "BAR_TRANSPOSE_THRESHOLD": 1 if not high_pressure else 2,
             "MELODY_PRIORITY": True,
             "MELODY_PITCH_WEIGHT": 1.0,
@@ -457,6 +714,20 @@ class MultiCandidateTuner:
             "OCTAVE_PREVIEW_NEIGHBORS": 0 if fixed_window else preview_neighbors,
             "OCTAVE_LOOKAHEAD": lookahead,
         }
+        if instrument_mode == "bass":
+            seed["LEFTMOST_NOTE"] = 12
+            seed["VISIBLE_OCTAVES"] = 3
+            seed["AUTO_SHIFT_FROM_RANGE"] = True
+            seed["USE_SHIFT_OCTAVE"] = True
+            seed["SHIFT_WEIGHT"] = max(1.70, float(seed["SHIFT_WEIGHT"]))
+            seed["MIN_NOTES_BETWEEN_SWITCHES"] = max(10, int(seed["MIN_NOTES_BETWEEN_SWITCHES"]))
+        elif instrument_mode == "guitar":
+            seed["USE_PEDAL"] = False
+            seed["SHIFT_HOLD_BASS"] = False
+            seed["CHORD_PRIORITY"] = True
+            seed["MELODY_PRIORITY"] = not chord_dense
+            seed["MELODY_KEEP_TOP"] = 1 if chord_dense else 2
+            seed["MIN_NOTES_BETWEEN_SWITCHES"] = max(8, int(seed["MIN_NOTES_BETWEEN_SWITCHES"]))
         return self._normalize_candidate(seed)
 
     def candidates(self, seed: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -560,10 +831,74 @@ class MultiCandidateTuner:
         group_indexes = self.probe_group_indexes if probe else self.full_eval_group_indexes
         return self._score_group_indexes(merged, group_indexes, stop_above=stop_above)
 
+    def _recommended_parallel_workers(self, task_count: int) -> int:
+        cpu_total = max(1, os.cpu_count() or 1)
+        if cpu_total <= 2:
+            return 1
+        reserve = 2 if cpu_total >= 6 else 1
+        worker_cap = 8 if cpu_total >= 12 else 6
+        workers = min(max(1, cpu_total - reserve), worker_cap)
+        return min(workers, max(1, task_count))
+
+    def _can_parallel_score(self, task_count: int) -> bool:
+        if task_count < 18:
+            return False
+        if self.total_group_count < 96 and self.feat["note_count"] < 900:
+            return False
+        return self._recommended_parallel_workers(task_count) >= 2
+
+    def _score_candidates_batch(
+        self,
+        candidates: List[Dict[str, Any]],
+        *,
+        probe: bool,
+        stop_above: Optional[float],
+    ) -> Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], str]:
+        if not candidates:
+            return [], "single-process x1"
+
+        if not self._can_parallel_score(len(candidates)):
+            scored: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
+            rolling_cutoff = stop_above
+            for cand in candidates:
+                score, detail = self.quick_score(cand, probe=probe, stop_above=rolling_cutoff)
+                scored.append((score, detail, cand))
+                if probe and (rolling_cutoff is None or score < rolling_cutoff):
+                    rolling_cutoff = score
+            return scored, "single-process x1"
+
+        workers = self._recommended_parallel_workers(len(candidates))
+        try:
+            chunksize = max(1, min(12, len(candidates) // max(1, workers * 3)))
+            payloads = [(cand, probe, stop_above) for cand in candidates]
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=ctx,
+                initializer=_init_tuner_worker,
+                initargs=(self.analysis, self.current_config, (self.user_min, self.user_max)),
+            ) as executor:
+                results = list(executor.map(_score_candidate_worker, payloads, chunksize=chunksize))
+            scored = [(score, detail, cand) for (score, detail), cand in zip(results, candidates)]
+            return scored, f"multiprocess x{workers}"
+        except Exception:
+            scored = []
+            rolling_cutoff = stop_above
+            for cand in candidates:
+                score, detail = self.quick_score(cand, probe=probe, stop_above=rolling_cutoff)
+                scored.append((score, detail, cand))
+                if probe and (rolling_cutoff is None or score < rolling_cutoff):
+                    rolling_cutoff = score
+            return scored, "single-process x1 (fallback)"
+
     def _advanced_refinement_candidates(self, best: Dict[str, Any]) -> List[Dict[str, Any]]:
         right_edge = int(best["LEFTMOST_NOTE"]) + int(best["VISIBLE_OCTAVES"]) * 12 - 1
         shift_needed_by_range = self.user_max > right_edge
         fixed_window = self._is_fixed_window_candidate(best)
+        heavy = self.total_group_count >= 300 or self.feat["note_count"] >= 2500
+        very_heavy = self.total_group_count >= 700 or self.feat["note_count"] >= 5500
+        mode = _instrument_mode(best)
+
         shift_choices = [bool(best.get("USE_SHIFT_OCTAVE", True))]
         if fixed_window:
             shift_choices = [False]
@@ -579,9 +914,6 @@ class MultiCandidateTuner:
             auto_shift_choices = list(dict.fromkeys(auto_shift_choices + [True, False]))
         else:
             auto_shift_choices = [True]
-
-        heavy = self.total_group_count >= 300 or self.feat["note_count"] >= 2500
-        very_heavy = self.total_group_count >= 700 or self.feat["note_count"] >= 5500
 
         collision_choices = [bool(best.get("OCTAVE_AVOID_COLLISION", False))]
         if fixed_window:
@@ -601,7 +933,27 @@ class MultiCandidateTuner:
         cooldown_deltas = (0, 2) if very_heavy else ((-2, 0, 2) if not heavy else (0, 2))
         cooldown_choices = sorted({max(0, int(best.get("MIN_NOTES_BETWEEN_SWITCHES", 12)) + d) for d in cooldown_deltas})
         min_note_len_deltas = (0.0, 0.01) if very_heavy else ((-0.01, 0.0, 0.01) if not heavy else (0.0, 0.01))
-        min_note_len_choices = sorted({round(min(0.14, max(0.05, float(best.get("MIN_NOTE_LEN", 0.1)) + d)), 3) for d in min_note_len_deltas})
+        min_note_len_choices = sorted({round(min(0.14, max(0.03, float(best.get("MIN_NOTE_LEN", 0.1)) + d)), 3) for d in min_note_len_deltas})
+
+        if mode == "guitar":
+            retrigger_choices = sorted({_clamp_retrigger_gap(best.get("RETRIGGER_GAP", DEFAULT_RETRIGGER_GAP) + d) for d in (-0.018, -0.012, -0.006, 0.0, 0.004)})
+            pedal_choices = [False]
+            melody_priority_choices = [bool(best.get("MELODY_PRIORITY", False)), False]
+            chord_priority_choices = [True]
+        elif mode == "bass":
+            retrigger_choices = sorted({_clamp_retrigger_gap(best.get("RETRIGGER_GAP", DEFAULT_RETRIGGER_GAP) + d) for d in (-0.018, -0.012, -0.006, 0.0, 0.004)})
+            pedal_choices = [bool(best.get("USE_PEDAL", False))]
+            melody_priority_choices = [False, bool(best.get("MELODY_PRIORITY", False))]
+            chord_priority_choices = [False, bool(best.get("CHORD_PRIORITY", False))]
+        else:
+            retrigger_choices = sorted({_clamp_retrigger_gap(best.get("RETRIGGER_GAP", DEFAULT_RETRIGGER_GAP) + d) for d in (-0.018, -0.012, -0.006, 0.0, 0.004)})
+            pedal_choices = [bool(best.get("USE_PEDAL", True))]
+            if self.feat["short_ratio_008"] < 0.15:
+                pedal_choices = list(dict.fromkeys(pedal_choices + [False, True]))
+            melody_priority_choices = [bool(best.get("MELODY_PRIORITY", True))]
+            chord_priority_choices = [bool(best.get("CHORD_PRIORITY", False))]
+            if self.feat["avg_chord"] >= 2.2:
+                chord_priority_choices = list(dict.fromkeys(chord_priority_choices + [True]))
 
         refine: List[Dict[str, Any]] = []
         for use_shift in shift_choices:
@@ -610,15 +962,23 @@ class MultiCandidateTuner:
                     for preview in preview_choices:
                         for cooldown in cooldown_choices:
                             for min_note_len in min_note_len_choices:
-                                cand = dict(best)
-                                cand["USE_SHIFT_OCTAVE"] = use_shift
-                                cand["AUTO_SHIFT_FROM_RANGE"] = auto_shift
-                                cand["OCTAVE_AVOID_COLLISION"] = collision
-                                cand["OCTAVE_PREVIEW_NEIGHBORS"] = preview
-                                cand["MIN_NOTES_BETWEEN_SWITCHES"] = cooldown
-                                cand["MIN_NOTE_LEN"] = min_note_len
-                                cand["OCTAVE_LOOKAHEAD"] = max(int(cand.get("LOOKAHEAD_NOTES", 24)), int(cand.get("OCTAVE_LOOKAHEAD", 0)))
-                                refine.append(self._normalize_candidate(cand))
+                                for retrigger_gap in retrigger_choices:
+                                    for use_pedal in pedal_choices:
+                                        for melody_priority in melody_priority_choices:
+                                            for chord_priority in chord_priority_choices:
+                                                cand = dict(best)
+                                                cand["USE_SHIFT_OCTAVE"] = use_shift
+                                                cand["AUTO_SHIFT_FROM_RANGE"] = auto_shift
+                                                cand["OCTAVE_AVOID_COLLISION"] = collision
+                                                cand["OCTAVE_PREVIEW_NEIGHBORS"] = preview
+                                                cand["MIN_NOTES_BETWEEN_SWITCHES"] = cooldown
+                                                cand["MIN_NOTE_LEN"] = min_note_len
+                                                cand["RETRIGGER_GAP"] = retrigger_gap
+                                                cand["USE_PEDAL"] = use_pedal
+                                                cand["MELODY_PRIORITY"] = melody_priority
+                                                cand["CHORD_PRIORITY"] = chord_priority
+                                                cand["OCTAVE_LOOKAHEAD"] = max(int(cand.get("LOOKAHEAD_NOTES", 24)), int(cand.get("OCTAVE_LOOKAHEAD", 0)))
+                                                refine.append(self._normalize_candidate(cand))
         return refine
 
     def tune(self) -> Tuple[Dict[str, Any], float, Dict[str, Any], int]:
@@ -630,14 +990,13 @@ class MultiCandidateTuner:
         best_score, best_detail = self.quick_score(seed, probe=False)
         tested += 1
 
+        probe_backend = "single-process x1"
         probe_best = best_score
-        probed: List[Tuple[float, Dict[str, Any]]] = []
-        for cand in candidates:
-            score, _detail = self.quick_score(cand, probe=True, stop_above=probe_best)
-            tested += 1
-            if score < probe_best:
-                probe_best = score
-            probed.append((score, cand))
+        probed_scored, probe_backend = self._score_candidates_batch(candidates, probe=True, stop_above=probe_best)
+        tested += len(candidates)
+        if probed_scored:
+            probe_best = min(probe_best, min(score for score, _detail, _cand in probed_scored))
+        probed: List[Tuple[float, Dict[str, Any]]] = [(score, cand) for score, _detail, cand in probed_scored]
 
         heavy = self.total_group_count >= 300 or self.feat["note_count"] >= 2500
         very_heavy = self.total_group_count >= 700 or self.feat["note_count"] >= 5500
@@ -651,15 +1010,11 @@ class MultiCandidateTuner:
                 best_detail = detail
 
         refine_candidates = self._advanced_refinement_candidates(best)
-        refine_probed: List[Tuple[float, Dict[str, Any]]] = []
-        refine_probe_best = best_score
-        for cand in refine_candidates:
-            score, _detail = self.quick_score(cand, probe=True, stop_above=refine_probe_best)
-            tested += 1
-            if score < refine_probe_best:
-                refine_probe_best = score
-            refine_probed.append((score, cand))
+        refine_backend = "single-process x1"
+        refine_probed_scored, refine_backend = self._score_candidates_batch(refine_candidates, probe=True, stop_above=best_score)
+        tested += len(refine_candidates)
         refine_top_n = 3 if very_heavy else (4 if heavy else 8)
+        refine_probed = [(score, cand) for score, _detail, cand in refine_probed_scored]
         for cand in [cand for _score, cand in sorted(refine_probed, key=lambda item: item[0])[:refine_top_n]]:
             score, detail = self.quick_score(cand, probe=False, stop_above=best_score)
             if score < best_score:
@@ -672,12 +1027,16 @@ class MultiCandidateTuner:
         best_detail["probe_groups"] = len(self.probe_group_indexes)
         best_detail["full_groups"] = len(self.full_eval_group_indexes)
         best_detail["total_groups"] = len(self.groups)
+        best_detail["probe_backend"] = probe_backend
+        best_detail["refine_probe_backend"] = refine_backend
         return final_best, best_score, best_detail, tested
 
 
 def _serialize_preview_value(key: str, value: Any) -> str:
     if key.endswith("_NOTE"):
         return midi_to_note_name(int(value))
+    if key == "INSTRUMENT_MODE":
+        return str(value)
     if isinstance(value, bool):
         return "开启" if value else "关闭"
     return str(value)
@@ -688,7 +1047,7 @@ def preview_lines(suggestions: Dict[str, Any]) -> List[str]:
     for key, label in PREVIEW_LABELS:
         if key not in suggestions:
             continue
-        lines.append(f"{label}：{_serialize_preview_value(key, suggestions[key])}")
+        lines.append(_html_line(label, _serialize_preview_value(key, suggestions[key]), bold=True, bullet=False))
     return lines
 
 
@@ -713,43 +1072,60 @@ def suggest_config(
     feat = tuner.feat
     filename = analysis.file_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
 
+    active_track_count = sum(1 for track in analysis.track_infos if track.note_count > 0)
+    total_track_count = len(analysis.track_infos)
+    shortest_note_sec = float(getattr(analysis, 'shortest_note_sec', 0.0) or 0.0)
+    shortest_raw_same_key_gap_sec = float(getattr(analysis, 'shortest_raw_same_key_gap_sec', 0.0) or getattr(analysis, 'shortest_retrigger_gap_sec', 0.0) or 0.0)
+
     lines = [
-        "自动调参建议（与当前播放逻辑同步评分）",
-        f"- 文件：{filename}",
-        f"- 音符数：{feat['note_count']}",
-        f"- 原始音域：{midi_to_note_name(feat['min_note'])} ~ {midi_to_note_name(feat['max_note'])}",
-        f"- 用户可弹奏区间：{midi_to_note_name(user_min)} ~ {midi_to_note_name(user_max)}",
-        f"- 平均和弦数：{feat['avg_chord']:.2f}",
-        f"- 最大和弦数：{feat['max_chord']}",
-        f"- 高音占比：{feat['high_ratio'] * 100:.1f}%",
-        f"- 低音占比：{feat['low_ratio'] * 100:.1f}%",
-        f"- 平均旋律跳进：{feat['avg_jump']:.2f}",
-        f"- 最大旋律跳进：{feat['max_jump']}",
-        f"- 短音比例(≤0.08s)：{feat['short_ratio_008'] * 100:.1f}%",
-        f"- 候选测试数：{tested}",
-        f"- 快速预筛组数：{best_detail.get('probe_groups', len(tuner.probe_group_indexes))} / 精算组数：{best_detail.get('full_groups', len(tuner.full_eval_group_indexes))} / 总组数：{best_detail.get('total_groups', len(tuner.groups))}",
-        f"- 最佳评分：{best_score:.2f}",
-        f"- 估计漏音：{best_detail['lost']}",
-        f"- 估计旋律损失：{best_detail['melody_loss']}",
-        f"- 估计突兀折返：{best_detail['harsh_fold']}",
-        f"- 估计切区次数：{best_detail['switch_need']}",
-        f"- 估计防撞代价：{best_detail['collision_penalty']}",
-        f"- 估计短音压缩代价：{best_detail['duration_penalty']}",
-        f"- 固定窗口模式：{'开启' if best_detail.get('fixed_window_mode') else '关闭'}",
+        "<b>自动调参建议（与当前播放逻辑同步评分）</b>",
+        _html_line("文件", filename),
+        _html_line("音符数", feat['note_count'], bold=True),
+        _html_line("总时长", _format_seconds_compact(analysis.duration_sec), bold=True),
+        _html_line("轨道数", f"{active_track_count} / {total_track_count}", bold=True),
+        _html_line("原始音域", f"{midi_to_note_name(feat['min_note'])} ~ {midi_to_note_name(feat['max_note'])}", bold=True),
+        _html_line("用户可弹奏区间", f"{midi_to_note_name(user_min)} ~ {midi_to_note_name(user_max)}", bold=True),
+        _html_line("当前 MIDI 最短按键时长", _format_seconds_compact(shortest_note_sec), bold=True),
+        _html_line("当前 MIDI 原始最短同键缝隙", _format_seconds_compact(shortest_raw_same_key_gap_sec), bold=True),
+        _html_line("统计说明", "按同一轨道、同一通道、同一音高中统计；优先使用真实 note_off，若缺失且遇到同键下一次 note_on，则按贴边结束处理。"),
+        _html_line("平均和弦数", f"{feat['avg_chord']:.2f}"),
+        _html_line("最大和弦数", feat['max_chord']),
+        _html_line("高音占比", f"{feat['high_ratio'] * 100:.1f}%"),
+        _html_line("低音占比", f"{feat['low_ratio'] * 100:.1f}%"),
+        _html_line("平均旋律跳进", f"{feat['avg_jump']:.2f}"),
+        _html_line("最大旋律跳进", feat['max_jump']),
+        _html_line("短音比例(≤0.08s)", f"{feat['short_ratio_008'] * 100:.1f}%"),
+        _html_line("快速重复比例", f"{feat['repeat_ratio'] * 100:.1f}%"),
+        _html_line("0.25 秒窗口内最大音符数", feat['burst_notes_025']),
+        _html_line("候选测试数", tested),
+        _html_line("预筛后端", best_detail.get('probe_backend', 'single-process x1')),
+        _html_line("精修预筛后端", best_detail.get('refine_probe_backend', 'single-process x1')),
+        _html_line("快速预筛组数", f"{best_detail.get('probe_groups', len(tuner.probe_group_indexes))} / 精算组数：{best_detail.get('full_groups', len(tuner.full_eval_group_indexes))} / 总组数：{best_detail.get('total_groups', len(tuner.groups))}"),
+        _html_line("最佳评分", f"{best_score:.2f}", bold=True),
+        _html_line("估计漏音", best_detail['lost']),
+        _html_line("估计旋律损失", best_detail['melody_loss']),
+        _html_line("估计突兀折返", best_detail['harsh_fold']),
+        _html_line("估计切区次数", best_detail['switch_need']),
+        _html_line("估计防撞代价", best_detail['collision_penalty']),
+        _html_line("估计短音压缩代价", best_detail['duration_penalty']),
+        _html_line("估计重按风险代价", best_detail.get('retrigger_penalty', 0.0)),
+        _html_line("固定窗口模式", '开启' if best_detail.get('fixed_window_mode') else '关闭'),
         "",
-        "调参结论：",
-        f"- 推荐基础窗口起点：{midi_to_note_name(int(best['LEFTMOST_NOTE']))}",
-        f"- 推荐可见八度数：{best['VISIBLE_OCTAVES']}",
-        f"- 推荐按音域自动判断切区：{'开启' if best['AUTO_SHIFT_FROM_RANGE'] else '关闭'}",
-        f"- 推荐固定窗口模式：{'开启' if (best['AUTO_SHIFT_FROM_RANGE'] and not best['USE_SHIFT_OCTAVE']) else '关闭'}",
-        f"- 推荐预读音符数：{best['LOOKAHEAD_NOTES']}",
-        f"- 推荐切换保守度：{best['SWITCH_MARGIN']}",
-        f"- 推荐切区冷却：{best['MIN_NOTES_BETWEEN_SWITCHES']}",
-        f"- 推荐区间移动偏好：{best['SHIFT_WEIGHT']}",
-        f"- 推荐最短按键时长：{best['MIN_NOTE_LEN']}",
-        f"- 推荐启用防撞：{'开启' if best['OCTAVE_AVOID_COLLISION'] else '关闭'}",
-        f"- 推荐邻近预览数量：{best['OCTAVE_PREVIEW_NEIGHBORS']}",
-        f"- 推荐局部移八度范围：{best['BAR_TRANSPOSE_SCOPE']}",
-        f"- 推荐旋律保留层数：{best['MELODY_KEEP_TOP']}",
+        "<b>调参结论：</b>",
+        _html_line("推荐基础窗口起点", midi_to_note_name(int(best['LEFTMOST_NOTE'])), bold=True),
+        _html_line("推荐可见八度数", best['VISIBLE_OCTAVES'], bold=True),
+        _html_line("推荐按音域自动判断切区", '开启' if best['AUTO_SHIFT_FROM_RANGE'] else '关闭', bold=True),
+        _html_line("推荐固定窗口模式", '开启' if (best['AUTO_SHIFT_FROM_RANGE'] and not best['USE_SHIFT_OCTAVE']) else '关闭', bold=True),
+        _html_line("推荐预读音符数", best['LOOKAHEAD_NOTES']),
+        _html_line("推荐切换保守度", best['SWITCH_MARGIN']),
+        _html_line("推荐切区冷却", best['MIN_NOTES_BETWEEN_SWITCHES']),
+        _html_line("推荐区间移动偏好", best['SHIFT_WEIGHT']),
+        _html_line("推荐最短按键时长", best['MIN_NOTE_LEN'], bold=True),
+        _html_line("推荐同键重按间隔", best['RETRIGGER_GAP'], bold=True),
+        _html_line("推荐启用踏板识别", '开启' if best['USE_PEDAL'] else '关闭'),
+        _html_line("推荐启用防撞", '开启' if best['OCTAVE_AVOID_COLLISION'] else '关闭'),
+        _html_line("推荐邻近预览数量", best['OCTAVE_PREVIEW_NEIGHBORS']),
+        _html_line("推荐局部移八度范围", best['BAR_TRANSPOSE_SCOPE']),
+        _html_line("推荐旋律保留层数", best['MELODY_KEEP_TOP']),
     ]
-    return best, "\n".join(lines)
+    return best, _html_block(lines)
