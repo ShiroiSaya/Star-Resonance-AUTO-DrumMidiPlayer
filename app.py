@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import multiprocessing
 import os
 import sys
 
@@ -108,6 +109,7 @@ class StartupSplash(QWidget):
 
 def main() -> int:
     global _QT_HANDLER
+    multiprocessing.freeze_support()
     install_global_hooks()
     append_runtime_log('Application starting.')
     try:
