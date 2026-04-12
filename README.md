@@ -5,7 +5,7 @@
 <h1 align="center">SayaTech-Midi-Studio</h1>
 
 <p align="center">
-  面向《星痕共鸣》的 Windows MIDI 自动演奏工具。<br>
+  面向《星痕共鸣》的 Windows MIDI 自动演奏工具（当前Readme已过时，待更新）。<br>
   支持 <b>钢琴 / 吉他 / 贝斯 / 架子鼓</b>、自动调参、合奏定时、主题外观与现代化桌面界面。
 </p>
 
