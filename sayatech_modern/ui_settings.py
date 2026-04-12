@@ -5,6 +5,8 @@ import os
 from dataclasses import asdict, dataclass
 from typing import Any, Dict
 
+from .app_paths import ensure_user_ui_settings_file, user_ui_settings_path
+
 
 @dataclass
 class UISettings:
@@ -60,12 +62,12 @@ def _normalize(data: Dict[str, Any]) -> UISettings:
     return UISettings(**values)
 
 
-def settings_path(project_root: str) -> str:
-    return os.path.join(project_root, "ui_settings.json")
+def settings_path(project_root: str | None = None) -> str:
+    return str(user_ui_settings_path())
 
 
-def load_ui_settings(project_root: str) -> UISettings:
-    path = settings_path(project_root)
+def load_ui_settings(project_root: str | None = None) -> UISettings:
+    path = str(ensure_user_ui_settings_file())
     if not os.path.exists(path):
         return UISettings()
     try:
@@ -78,8 +80,9 @@ def load_ui_settings(project_root: str) -> UISettings:
         return UISettings()
 
 
-def save_ui_settings(project_root: str, settings: UISettings) -> str:
+def save_ui_settings(project_root: str | None, settings: UISettings) -> str:
     path = settings_path(project_root)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(asdict(settings), f, ensure_ascii=False, indent=2)
     return path
