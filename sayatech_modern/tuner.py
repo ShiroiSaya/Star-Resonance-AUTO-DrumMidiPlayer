@@ -1,20 +1,24 @@
 from __future__ import annotations
 
+import atexit
 import html
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 import os
+import sys
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .backend import ModernPianoBackend
+from .backend import BASS_PLAYABLE_COUNT, BASS_PLAYABLE_START_OFFSET, ModernPianoBackend
+from .cache_store import freeze_value, load_pickle, make_key, save_pickle
+from .gpu_accel import resolve_compute_backend
 from .config_io import midi_to_note_name
 from .models import MidiAnalysisResult, NoteSpan
+from .crash_logging import append_runtime_log
 
 PREVIEW_LABELS: List[Tuple[str, str]] = [
     ("INSTRUMENT_MODE", "乐器模式"),
     ("LEFTMOST_NOTE", "基础窗口起点"),
-    ("VISIBLE_OCTAVES", "窗口八度数"),
     ("UNLOCKED_MIN_NOTE", "可弹最低音"),
     ("UNLOCKED_MAX_NOTE", "可弹最高音"),
     ("AUTO_SHIFT_FROM_RANGE", "按音域自动判断切区"),
@@ -36,6 +40,15 @@ PREVIEW_LABELS: List[Tuple[str, str]] = [
 ]
 
 DEFAULT_RETRIGGER_GAP = 0.021
+
+
+def _tuner_cache_key(analysis: MidiAnalysisResult, current_config: Dict[str, Any], playable_range: Tuple[int, int]) -> str:
+    analysis_key = str(getattr(analysis, "analysis_cache_key", "") or getattr(analysis, "source_sha256", "") or analysis.file_path)
+    return make_key("tuner", {
+        "analysis": analysis_key,
+        "playable_range": (int(playable_range[0]), int(playable_range[1])),
+        "config": freeze_value(current_config),
+    })
 
 
 
@@ -63,7 +76,26 @@ def _html_block(lines: List[str]) -> str:
     return "<div style='white-space:pre-wrap; line-height:1.55;'>" + "<br>".join(lines) + "</div>"
 
 
+
 _WORKER_TUNER: Optional["MultiCandidateTuner"] = None
+_SCORING_POOL: Optional[ProcessPoolExecutor] = None
+_SCORING_POOL_KEY: Optional[tuple] = None
+_SCORING_POOL_WORKERS: int = 0
+
+
+def _shutdown_scoring_pool() -> None:
+    global _SCORING_POOL, _SCORING_POOL_KEY, _SCORING_POOL_WORKERS
+    if _SCORING_POOL is not None:
+        try:
+            _SCORING_POOL.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+    _SCORING_POOL = None
+    _SCORING_POOL_KEY = None
+    _SCORING_POOL_WORKERS = 0
+
+
+atexit.register(_shutdown_scoring_pool)
 
 
 def _init_tuner_worker(
@@ -72,7 +104,7 @@ def _init_tuner_worker(
     playable_range: Tuple[int, int],
 ) -> None:
     global _WORKER_TUNER
-    _WORKER_TUNER = MultiCandidateTuner(analysis, current_config, playable_range)
+    _WORKER_TUNER = MultiCandidateTuner(analysis, current_config, playable_range, use_gpu=False)
 
 
 def _score_candidate_worker(payload: Tuple[Dict[str, Any], bool, Optional[float]]) -> Tuple[float, Dict[str, Any]]:
@@ -82,6 +114,65 @@ def _score_candidate_worker(payload: Tuple[Dict[str, Any], bool, Optional[float]
     candidate, probe, stop_above = payload
     return tuner.quick_score(candidate, probe=probe, stop_above=stop_above)
 
+
+def _worker_ping() -> int:
+    return os.getpid()
+
+
+def _detect_frozen_bundle_mode() -> str:
+    if not getattr(sys, "frozen", False):
+        return "source"
+    meipass = getattr(sys, "_MEIPASS", "")
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    try:
+        meipass_abs = os.path.abspath(str(meipass))
+    except Exception:
+        meipass_abs = ""
+    try:
+        common = os.path.commonpath([exe_dir, meipass_abs]) if meipass_abs else ""
+    except Exception:
+        common = ""
+    if common and os.path.normcase(common) == os.path.normcase(exe_dir):
+        return "onedir"
+    return "onefile"
+
+
+def _pool_state_key(analysis: MidiAnalysisResult, current_config: Dict[str, Any], playable_range: Tuple[int, int]) -> tuple:
+    analysis_key = int(getattr(analysis, 'source_analysis_id', 0) or id(analysis))
+    config_sig = tuple(sorted((str(k), repr(v)) for k, v in current_config.items()))
+    return (analysis_key, config_sig, int(playable_range[0]), int(playable_range[1]), len(getattr(analysis, 'notes', ()) or ()))
+
+
+def _get_scoring_pool(analysis: MidiAnalysisResult, current_config: Dict[str, Any], playable_range: Tuple[int, int], workers: int) -> ProcessPoolExecutor:
+    global _SCORING_POOL, _SCORING_POOL_KEY, _SCORING_POOL_WORKERS
+    workers = max(1, int(workers))
+    desired_key = _pool_state_key(analysis, current_config, playable_range)
+    if _SCORING_POOL is not None and _SCORING_POOL_KEY == desired_key and _SCORING_POOL_WORKERS == workers:
+        return _SCORING_POOL
+    _shutdown_scoring_pool()
+    ctx = mp.get_context("spawn")
+    bundle_mode = _detect_frozen_bundle_mode()
+    append_runtime_log(f"自动调参准备创建评分进程池：workers={workers}, bundle={bundle_mode}", debug=True)
+    pool = ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=ctx,
+        initializer=_init_tuner_worker,
+        initargs=(analysis, current_config, playable_range),
+    )
+    try:
+        worker_pid = int(pool.submit(_worker_ping).result(timeout=12.0))
+    except Exception as exc:
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        append_runtime_log(f"自动调参评分进程池预热失败，将回退单进程：{type(exc).__name__}: {exc}")
+        raise
+    _SCORING_POOL = pool
+    _SCORING_POOL_KEY = desired_key
+    _SCORING_POOL_WORKERS = workers
+    append_runtime_log(f"自动调参评分进程池已就绪：workers={workers}, worker_pid={worker_pid}, bundle={bundle_mode}", debug=True)
+    return _SCORING_POOL
 
 
 def _round_left_to_c(note: int) -> int:
@@ -276,7 +367,7 @@ def _feature_summary(analysis: MidiAnalysisResult, threshold: float) -> Dict[str
 
 
 class MultiCandidateTuner:
-    def __init__(self, analysis: MidiAnalysisResult, current_config: Dict[str, Any], playable_range: Tuple[int, int]):
+    def __init__(self, analysis: MidiAnalysisResult, current_config: Dict[str, Any], playable_range: Tuple[int, int], use_gpu: bool = False):
         self.analysis = analysis
         self.current_config = dict(current_config)
         user_min, user_max = playable_range
@@ -285,8 +376,15 @@ class MultiCandidateTuner:
         self.user_min = user_min
         self.user_max = user_max
         self.threshold = _safe_float(current_config, "CHORD_SPLIT_THRESHOLD", 0.05)
+        self.compute_backend = resolve_compute_backend(use_gpu)
+        cached_threshold = float(getattr(analysis, 'group_threshold_sec', 0.035) or 0.035)
+        cached_groups = getattr(analysis, 'grouped_notes_default', ()) or ()
+        if cached_groups and abs(self.threshold - cached_threshold) <= 1e-9:
+            self.groups = [list(group) for group in cached_groups]
+        else:
+            self.groups = _group_notes(analysis.notes, self.threshold)
         self.feat = _feature_summary(analysis, self.threshold)
-        self.groups: List[List[NoteSpan]] = self.feat["groups"]
+        self.feat["groups"] = self.groups
         self.section_profile = self._build_section_profile()
         self.backend = ModernPianoBackend()
         self.backend.update_config(self.current_config)
@@ -299,14 +397,30 @@ class MultiCandidateTuner:
         self.total_note_count = running
         self.probe_group_indexes = self._build_probe_group_indexes()
         self.full_eval_group_indexes = self._build_full_eval_group_indexes()
+        self.group_start_secs = list(getattr(analysis, 'group_start_secs', ()) or ())
+        self.group_note_counts = list(getattr(analysis, 'group_note_counts', ()) or ())
+        self.group_min_notes = list(getattr(analysis, 'group_min_notes', ()) or ())
+        self.group_max_notes = list(getattr(analysis, 'group_max_notes', ()) or ())
+        self.group_avg_notes = list(getattr(analysis, 'group_avg_notes', ()) or ())
+        if len(self.group_start_secs) != self.total_group_count or abs(self.threshold - cached_threshold) > 1e-9:
+            self.group_start_secs = [float(group[0].start_sec) if group else 0.0 for group in self.groups]
+            self.group_note_counts = [len(group) for group in self.groups]
+            self.group_min_notes = [min((n.midi_note for n in group), default=self.user_min) for group in self.groups]
+            self.group_max_notes = [max((n.midi_note for n in group), default=self.user_max) for group in self.groups]
+            self.group_avg_notes = [sum(n.midi_note for n in group) / max(1, len(group)) for group in self.groups]
 
 
     def _range_fits_window(self, leftmost: int, visible_octaves: int) -> bool:
-        right_edge = int(leftmost) + max(1, int(visible_octaves)) * 12 - 1
-        return self.user_min >= int(leftmost) and self.user_max <= right_edge
+        left_edge = int(leftmost)
+        right_edge = left_edge + max(1, int(visible_octaves)) * 12 - 1
+        mode = _instrument_mode(self.current_config)
+        if mode == "bass":
+            left_edge += BASS_PLAYABLE_START_OFFSET
+            right_edge = min(right_edge, left_edge + BASS_PLAYABLE_COUNT - 1)
+        return self.user_min >= left_edge and self.user_max <= right_edge
 
     def _is_fixed_window_candidate(self, merged: Dict[str, Any]) -> bool:
-        return bool(merged.get("AUTO_SHIFT_FROM_RANGE", True)) and self._range_fits_window(int(merged.get("LEFTMOST_NOTE", self.user_min)), int(merged.get("VISIBLE_OCTAVES", 3)))
+        return bool(merged.get("AUTO_SHIFT_FROM_RANGE", True)) and self._range_fits_window(int(merged.get("LEFTMOST_NOTE", self.user_min)), 3)
 
 
     def _build_full_eval_group_indexes(self) -> List[int]:
@@ -568,7 +682,8 @@ class MultiCandidateTuner:
         merged["UNLOCKED_MAX_NOTE"] = self.user_max
         instrument_mode = _instrument_mode(merged)
         merged["INSTRUMENT_MODE"] = "贝斯" if instrument_mode == "bass" else ("吉他" if instrument_mode == "guitar" else "钢琴")
-        visible_octaves = max(1, int(merged.get("VISIBLE_OCTAVES", 3)))
+        visible_octaves = 3
+        merged["VISIBLE_OCTAVES"] = 3
         if instrument_mode == "bass":
             visible_octaves = 3
             merged["VISIBLE_OCTAVES"] = visible_octaves
@@ -581,8 +696,12 @@ class MultiCandidateTuner:
             merged["LEFTMOST_NOTE"] = min(leftmost, max_leftmost)
         merged["AUTO_SHIFT_FROM_RANGE"] = bool(merged.get("AUTO_SHIFT_FROM_RANGE", True))
         merged["USE_SHIFT_OCTAVE"] = bool(merged.get("USE_SHIFT_OCTAVE", True))
-        right_edge = int(merged["LEFTMOST_NOTE"]) + visible_octaves * 12 - 1
-        fixed_window = bool(merged["AUTO_SHIFT_FROM_RANGE"]) and self.user_min >= int(merged["LEFTMOST_NOTE"]) and self.user_max <= right_edge
+        left_edge = int(merged["LEFTMOST_NOTE"])
+        right_edge = left_edge + visible_octaves * 12 - 1
+        if instrument_mode == "bass":
+            left_edge += BASS_PLAYABLE_START_OFFSET
+            right_edge = min(right_edge, left_edge + BASS_PLAYABLE_COUNT - 1)
+        fixed_window = bool(merged["AUTO_SHIFT_FROM_RANGE"]) and self.user_min >= left_edge and self.user_max <= right_edge
         if fixed_window:
             merged["USE_SHIFT_OCTAVE"] = False
             merged["SWITCH_MARGIN"] = 0
@@ -604,12 +723,10 @@ class MultiCandidateTuner:
         playable_span = self.user_max - self.user_min + 1
         instrument_mode = _instrument_mode(self.current_config)
         current_leftmost = _safe_int(self.current_config, "LEFTMOST_NOTE", self.user_min)
-        visible_octaves = _safe_int(self.current_config, "VISIBLE_OCTAVES", 3)
+        visible_octaves = 3
         if instrument_mode == "bass":
             current_leftmost = 12
             visible_octaves = 3
-        if playable_span < visible_octaves * 12:
-            visible_octaves = max(1, min(visible_octaves, max(1, playable_span // 12)))
         window_size = max(12, visible_octaves * 12)
         max_leftmost = max(self.user_min, self.user_max - window_size + 1)
         leftmost = min(max(_round_left_to_c(current_leftmost), self.user_min), max_leftmost)
@@ -636,11 +753,15 @@ class MultiCandidateTuner:
         repeat_ratio = self.feat["repeat_ratio"]
         section_instability = self.section_profile["pressure_spread"] >= 0.18 or self.section_profile["max_section_pressure"] >= 0.24
 
+        left_edge = leftmost
         right_edge = leftmost + window_size - 1
+        if instrument_mode == "bass":
+            left_edge += BASS_PLAYABLE_START_OFFSET
+            right_edge = min(right_edge, left_edge + BASS_PLAYABLE_COUNT - 1)
         shift_possible = self.user_max > right_edge
         auto_shift = True
         use_shift = shift_possible
-        fixed_window = self.user_min >= leftmost and self.user_max <= right_edge
+        fixed_window = self.user_min >= left_edge and self.user_max <= right_edge
         if note_span <= window_size and self.feat["high_ratio"] < 0.10:
             use_shift = False
         if fixed_window:
@@ -675,7 +796,7 @@ class MultiCandidateTuner:
         seed: Dict[str, Any] = {
             "INSTRUMENT_MODE": "贝斯" if instrument_mode == "bass" else ("吉他" if instrument_mode == "guitar" else "钢琴"),
             "LEFTMOST_NOTE": leftmost,
-            "VISIBLE_OCTAVES": visible_octaves,
+            "VISIBLE_OCTAVES": 3,
             "UNLOCKED_MIN_NOTE": self.user_min,
             "UNLOCKED_MAX_NOTE": self.user_max,
             "AUTO_TRANSPOSE": True,
@@ -831,6 +952,84 @@ class MultiCandidateTuner:
         group_indexes = self.probe_group_indexes if probe else self.full_eval_group_indexes
         return self._score_group_indexes(merged, group_indexes, stop_above=stop_above)
 
+    def _gpu_coarse_rank_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+        *,
+        keep_top: int,
+        stage: str,
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        if not candidates:
+            return [], "未执行 GPU 粗筛"
+        if not self.compute_backend.using_gpu:
+            return list(candidates), f"{self.compute_backend.summary_text}（未启用 GPU 粗筛）"
+        try:
+            import torch  # type: ignore
+        except Exception as exc:
+            return list(candidates), f"GPU 粗筛不可用：{exc}"
+        try:
+            normalized = [self._normalize_candidate(cand) for cand in candidates]
+            device = 'cuda'
+            cand_count = len(normalized)
+            group_count = max(1, len(self.group_min_notes))
+            group_min = torch.tensor(self.group_min_notes or [self.user_min], dtype=torch.float32, device=device)
+            group_max = torch.tensor(self.group_max_notes or [self.user_max], dtype=torch.float32, device=device)
+            group_size = torch.tensor(self.group_note_counts or [1], dtype=torch.float32, device=device)
+            group_avg = torch.tensor(self.group_avg_notes or [float((self.user_min + self.user_max) / 2)], dtype=torch.float32, device=device)
+            leftmost = torch.tensor([float(c['LEFTMOST_NOTE']) for c in normalized], dtype=torch.float32, device=device)
+            visible_octaves = torch.tensor([3.0 for _ in normalized], dtype=torch.float32, device=device)
+            auto_shift = torch.tensor([1.0 if bool(c.get('AUTO_SHIFT_FROM_RANGE', True)) else 0.0 for c in normalized], dtype=torch.float32, device=device)
+            use_shift = torch.tensor([1.0 if bool(c.get('USE_SHIFT_OCTAVE', True)) else 0.0 for c in normalized], dtype=torch.float32, device=device)
+            fold_weight = torch.tensor([float(c.get('OCTAVE_FOLD_WEIGHT', 0.55)) for c in normalized], dtype=torch.float32, device=device)
+            switch_margin = torch.tensor([float(c.get('SWITCH_MARGIN', 1)) for c in normalized], dtype=torch.float32, device=device)
+            shift_weight = torch.tensor([float(c.get('SHIFT_WEIGHT', 1.0)) for c in normalized], dtype=torch.float32, device=device)
+            melody_keep = torch.tensor([float(c.get('MELODY_KEEP_TOP', 1)) for c in normalized], dtype=torch.float32, device=device)
+            keep_bass = torch.tensor([1.0 if bool(c.get('SHIFT_HOLD_BASS', False)) else 0.0 for c in normalized], dtype=torch.float32, device=device)
+            bar_aware = torch.tensor([1.0 if bool(c.get('BAR_AWARE_TRANSPOSE', True)) else 0.0 for c in normalized], dtype=torch.float32, device=device)
+            min_note_len = torch.tensor([float(c.get('MIN_NOTE_LEN', 0.1)) for c in normalized], dtype=torch.float32, device=device)
+            retrigger_gap = torch.tensor([float(c.get('RETRIGGER_GAP', DEFAULT_RETRIGGER_GAP)) for c in normalized], dtype=torch.float32, device=device)
+            fixed_window = torch.tensor([
+                1.0 if (bool(c.get('AUTO_SHIFT_FROM_RANGE', True)) and self._range_fits_window(int(c.get('LEFTMOST_NOTE', self.user_min)), 3)) else 0.0
+                for c in normalized
+            ], dtype=torch.float32, device=device)
+
+            offsets = torch.tensor(list(range(-4, 5)), dtype=torch.float32, device=device)
+            remainders = torch.remainder(offsets.to(torch.int64), 3)
+            shift_mask = (remainders == 1).to(torch.float32)
+            offset_mask = torch.ones((cand_count, offsets.numel()), dtype=torch.float32, device=device)
+            offset_mask = offset_mask * (1.0 - ((1.0 - use_shift).unsqueeze(1) * shift_mask.unsqueeze(0)))
+            offset_mask[:, 0:0] = offset_mask[:, 0:0]
+            fixed_offset_mask = torch.zeros_like(offset_mask)
+            fixed_offset_mask[:, 4] = 1.0
+            offset_mask = torch.where(fixed_window.unsqueeze(1) > 0.5, fixed_offset_mask, offset_mask)
+            base_left = leftmost.unsqueeze(1) + offsets.unsqueeze(0) * 12.0
+            base_right = base_left + visible_octaves.unsqueeze(1) * 12.0 - 1.0
+            low_over = torch.clamp(base_left.unsqueeze(1) - group_min.view(1, group_count, 1), min=0.0)
+            high_over = torch.clamp(group_max.view(1, group_count, 1) - base_right.unsqueeze(1), min=0.0)
+            center_pen = torch.abs(((base_left + base_right) * 0.5).unsqueeze(1) - group_avg.view(1, group_count, 1)) * 0.02
+            pressure = low_over * (1.0 - keep_bass.view(cand_count, 1, 1) * 0.15) + high_over * (1.08 + melody_keep.view(cand_count, 1, 1) * 0.08) + center_pen
+            pressure = pressure * (1.0 - bar_aware.view(cand_count, 1, 1) * 0.08)
+            pressure = pressure * torch.clamp(1.0 - fold_weight.view(cand_count, 1, 1) * 0.35, min=0.45)
+            invalid_pen = (1.0 - offset_mask).view(cand_count, 1, offsets.numel()) * 1e6
+            pressure = pressure + invalid_pen
+            best_pressure, best_offset_idx = torch.min(pressure, dim=2)
+            group_weight = 1.0 + torch.clamp(group_size - 1.0, min=0.0) * 0.22
+            total_pen = (best_pressure * group_weight.view(1, group_count)).sum(dim=1)
+            if group_count > 1:
+                switch_changes = (best_offset_idx[:, 1:] != best_offset_idx[:, :-1]).to(torch.float32).sum(dim=1)
+            else:
+                switch_changes = torch.zeros((cand_count,), dtype=torch.float32, device=device)
+            switch_pen = switch_changes * (0.35 + switch_margin * 0.18) / torch.clamp(shift_weight, min=0.8)
+            duration_pen = torch.clamp(min_note_len - float(getattr(self.analysis, 'shortest_note_sec', 0.0) or 0.0), min=0.0) * (48.0 + group_count * 0.02)
+            retrigger_pen = torch.clamp(retrigger_gap - float(getattr(self.analysis, 'shortest_raw_same_key_gap_sec', 0.0) or getattr(self.analysis, 'shortest_retrigger_gap_sec', 0.0) or 0.0), min=0.0) * 140.0
+            scores = total_pen + switch_pen + duration_pen + retrigger_pen
+            torch.cuda.synchronize()
+            values = scores.detach().cpu().tolist()
+            ranked = [cand for _score, cand in sorted(zip(values, normalized), key=lambda item: item[0])[: max(1, min(keep_top, len(normalized)))]]
+            return ranked, f"GPU 粗筛（{stage}）{len(candidates)}→{len(ranked)}"
+        except Exception as exc:
+            return list(candidates), f"GPU 粗筛失败，已回退 CPU：{exc}"
+
     def _recommended_parallel_workers(self, task_count: int) -> int:
         cpu_total = max(1, os.cpu_count() or 1)
         if cpu_total <= 2:
@@ -841,9 +1040,9 @@ class MultiCandidateTuner:
         return min(workers, max(1, task_count))
 
     def _can_parallel_score(self, task_count: int) -> bool:
-        if task_count < 18:
+        if task_count < 8:
             return False
-        if self.total_group_count < 96 and self.feat["note_count"] < 900:
+        if self.total_group_count < 48 and self.feat["note_count"] < 480:
             return False
         return self._recommended_parallel_workers(task_count) >= 2
 
@@ -871,17 +1070,14 @@ class MultiCandidateTuner:
         try:
             chunksize = max(1, min(12, len(candidates) // max(1, workers * 3)))
             payloads = [(cand, probe, stop_above) for cand in candidates]
-            ctx = mp.get_context("spawn")
-            with ProcessPoolExecutor(
-                max_workers=workers,
-                mp_context=ctx,
-                initializer=_init_tuner_worker,
-                initargs=(self.analysis, self.current_config, (self.user_min, self.user_max)),
-            ) as executor:
-                results = list(executor.map(_score_candidate_worker, payloads, chunksize=chunksize))
+            executor = _get_scoring_pool(self.analysis, self.current_config, (self.user_min, self.user_max), workers)
+            results = list(executor.map(_score_candidate_worker, payloads, chunksize=chunksize))
             scored = [(score, detail, cand) for (score, detail), cand in zip(results, candidates)]
-            return scored, f"multiprocess x{workers}"
-        except Exception:
+            return scored, f"multiprocess x{workers}（常驻池）"
+        except Exception as exc:
+            append_runtime_log(
+                f"自动调参并行评分失败，回退单进程：{type(exc).__name__}: {exc} | bundle={_detect_frozen_bundle_mode()} | candidates={len(candidates)} | probe={probe}"
+            )
             scored = []
             rolling_cutoff = stop_above
             for cand in candidates:
@@ -892,12 +1088,16 @@ class MultiCandidateTuner:
             return scored, "single-process x1 (fallback)"
 
     def _advanced_refinement_candidates(self, best: Dict[str, Any]) -> List[Dict[str, Any]]:
-        right_edge = int(best["LEFTMOST_NOTE"]) + int(best["VISIBLE_OCTAVES"]) * 12 - 1
+        mode = _instrument_mode(best)
+        left_edge = int(best["LEFTMOST_NOTE"])
+        right_edge = left_edge + 36 - 1
+        if mode == "bass":
+            left_edge += BASS_PLAYABLE_START_OFFSET
+            right_edge = min(right_edge, left_edge + BASS_PLAYABLE_COUNT - 1)
         shift_needed_by_range = self.user_max > right_edge
         fixed_window = self._is_fixed_window_candidate(best)
         heavy = self.total_group_count >= 300 or self.feat["note_count"] >= 2500
         very_heavy = self.total_group_count >= 700 or self.feat["note_count"] >= 5500
-        mode = _instrument_mode(best)
 
         shift_choices = [bool(best.get("USE_SHIFT_OCTAVE", True))]
         if fixed_window:
@@ -990,16 +1190,18 @@ class MultiCandidateTuner:
         best_score, best_detail = self.quick_score(seed, probe=False)
         tested += 1
 
+        heavy = self.total_group_count >= 300 or self.feat["note_count"] >= 2500
+        very_heavy = self.total_group_count >= 700 or self.feat["note_count"] >= 5500
+        probe_keep_top = 24 if very_heavy else (36 if heavy else 56)
+        probe_cpu_candidates, coarse_backend = self._gpu_coarse_rank_candidates(candidates, keep_top=probe_keep_top, stage='预筛')
         probe_backend = "single-process x1"
         probe_best = best_score
-        probed_scored, probe_backend = self._score_candidates_batch(candidates, probe=True, stop_above=probe_best)
-        tested += len(candidates)
+        probed_scored, probe_backend = self._score_candidates_batch(probe_cpu_candidates, probe=True, stop_above=probe_best)
+        tested += len(probe_cpu_candidates)
         if probed_scored:
             probe_best = min(probe_best, min(score for score, _detail, _cand in probed_scored))
         probed: List[Tuple[float, Dict[str, Any]]] = [(score, cand) for score, _detail, cand in probed_scored]
 
-        heavy = self.total_group_count >= 300 or self.feat["note_count"] >= 2500
-        very_heavy = self.total_group_count >= 700 or self.feat["note_count"] >= 5500
         full_top_n = 4 if very_heavy else (6 if heavy else 12)
         top_candidates = [cand for _score, cand in sorted(probed, key=lambda item: item[0])[:full_top_n]]
         for cand in top_candidates:
@@ -1010,9 +1212,11 @@ class MultiCandidateTuner:
                 best_detail = detail
 
         refine_candidates = self._advanced_refinement_candidates(best)
+        refine_keep_top = 18 if very_heavy else (24 if heavy else 40)
+        refine_cpu_candidates, refine_coarse_backend = self._gpu_coarse_rank_candidates(refine_candidates, keep_top=refine_keep_top, stage='精修预筛')
         refine_backend = "single-process x1"
-        refine_probed_scored, refine_backend = self._score_candidates_batch(refine_candidates, probe=True, stop_above=best_score)
-        tested += len(refine_candidates)
+        refine_probed_scored, refine_backend = self._score_candidates_batch(refine_cpu_candidates, probe=True, stop_above=best_score)
+        tested += len(refine_cpu_candidates)
         refine_top_n = 3 if very_heavy else (4 if heavy else 8)
         refine_probed = [(score, cand) for score, _detail, cand in refine_probed_scored]
         for cand in [cand for _score, cand in sorted(refine_probed, key=lambda item: item[0])[:refine_top_n]]:
@@ -1029,6 +1233,12 @@ class MultiCandidateTuner:
         best_detail["total_groups"] = len(self.groups)
         best_detail["probe_backend"] = probe_backend
         best_detail["refine_probe_backend"] = refine_backend
+        best_detail["coarse_backend"] = coarse_backend
+        best_detail["refine_coarse_backend"] = refine_coarse_backend
+        best_detail["coarse_probe_candidates"] = len(probe_cpu_candidates)
+        best_detail["coarse_probe_source"] = len(candidates)
+        best_detail["coarse_refine_candidates"] = len(refine_cpu_candidates)
+        best_detail["coarse_refine_source"] = len(refine_candidates)
         return final_best, best_score, best_detail, tested
 
 
@@ -1055,6 +1265,8 @@ def suggest_config(
     analysis: MidiAnalysisResult,
     current_config: Dict[str, Any],
     playable_range: Optional[Tuple[int, int]] = None,
+    *,
+    use_gpu: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     if not analysis.notes:
         return {}, "当前 MIDI 没有可用音符，无法自动调参。"
@@ -1067,8 +1279,28 @@ def suggest_config(
     if user_min > user_max:
         user_min, user_max = user_max, user_min
 
-    tuner = MultiCandidateTuner(analysis, current_config, (user_min, user_max))
-    best, best_score, best_detail, tested = tuner.tune()
+    playable_key = (user_min, user_max)
+    cache_key = _tuner_cache_key(analysis, current_config, playable_key)
+    cached_payload = load_pickle("tuner", cache_key)
+    compute_backend = resolve_compute_backend(use_gpu)
+    tuner = MultiCandidateTuner(analysis, current_config, playable_key, use_gpu=use_gpu)
+    if isinstance(cached_payload, dict) and all(k in cached_payload for k in ("best", "best_score", "best_detail", "tested")):
+        best = dict(cached_payload.get("best") or {})
+        best_score = float(cached_payload.get("best_score", 0.0) or 0.0)
+        best_detail = dict(cached_payload.get("best_detail") or {})
+        tested = int(cached_payload.get("tested", 0) or 0)
+        best_detail.setdefault("probe_backend", "本地缓存命中")
+    else:
+        best, best_score, best_detail, tested = tuner.tune()
+        try:
+            save_pickle("tuner", cache_key, {
+                "best": dict(best),
+                "best_score": float(best_score),
+                "best_detail": dict(best_detail),
+                "tested": int(tested),
+            }, meta={"kind": "tuner", "analysis": str(getattr(analysis, "analysis_cache_key", "") or getattr(analysis, "source_sha256", "") or ""), "playable_range": [int(user_min), int(user_max)]})
+        except Exception:
+            pass
     feat = tuner.feat
     filename = analysis.file_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
 
@@ -1083,6 +1315,7 @@ def suggest_config(
         _html_line("音符数", feat['note_count'], bold=True),
         _html_line("总时长", _format_seconds_compact(analysis.duration_sec), bold=True),
         _html_line("轨道数", f"{active_track_count} / {total_track_count}", bold=True),
+        _html_line("统计计算后端", compute_backend.summary_text, bold=True),
         _html_line("原始音域", f"{midi_to_note_name(feat['min_note'])} ~ {midi_to_note_name(feat['max_note'])}", bold=True),
         _html_line("用户可弹奏区间", f"{midi_to_note_name(user_min)} ~ {midi_to_note_name(user_max)}", bold=True),
         _html_line("当前 MIDI 最短按键时长", _format_seconds_compact(shortest_note_sec), bold=True),
@@ -1098,8 +1331,12 @@ def suggest_config(
         _html_line("快速重复比例", f"{feat['repeat_ratio'] * 100:.1f}%"),
         _html_line("0.25 秒窗口内最大音符数", feat['burst_notes_025']),
         _html_line("候选测试数", tested),
-        _html_line("预筛后端", best_detail.get('probe_backend', 'single-process x1')),
-        _html_line("精修预筛后端", best_detail.get('refine_probe_backend', 'single-process x1')),
+        _html_line("本地调参缓存", "已命中" if isinstance(cached_payload, dict) and all(k in cached_payload for k in ("best", "best_score", "best_detail", "tested")) else "未命中"),
+        _html_line("GPU 粗筛后端", best_detail.get('coarse_backend', '未执行')),
+        _html_line("GPU 精修粗筛后端", best_detail.get('refine_coarse_backend', '未执行')),
+        _html_line("自动调参预筛后端", best_detail.get('probe_backend', 'single-process x1')),
+        _html_line("自动调参精修预筛后端", best_detail.get('refine_probe_backend', 'single-process x1')),
+        _html_line("粗筛候选收缩", f"{best_detail.get('coarse_probe_source', 0)} → {best_detail.get('coarse_probe_candidates', 0)} / 精修 {best_detail.get('coarse_refine_source', 0)} → {best_detail.get('coarse_refine_candidates', 0)}"),
         _html_line("快速预筛组数", f"{best_detail.get('probe_groups', len(tuner.probe_group_indexes))} / 精算组数：{best_detail.get('full_groups', len(tuner.full_eval_group_indexes))} / 总组数：{best_detail.get('total_groups', len(tuner.groups))}"),
         _html_line("最佳评分", f"{best_score:.2f}", bold=True),
         _html_line("估计漏音", best_detail['lost']),
@@ -1113,7 +1350,6 @@ def suggest_config(
         "",
         "<b>调参结论：</b>",
         _html_line("推荐基础窗口起点", midi_to_note_name(int(best['LEFTMOST_NOTE'])), bold=True),
-        _html_line("推荐可见八度数", best['VISIBLE_OCTAVES'], bold=True),
         _html_line("推荐按音域自动判断切区", '开启' if best['AUTO_SHIFT_FROM_RANGE'] else '关闭', bold=True),
         _html_line("推荐固定窗口模式", '开启' if (best['AUTO_SHIFT_FROM_RANGE'] and not best['USE_SHIFT_OCTAVE']) else '关闭', bold=True),
         _html_line("推荐预读音符数", best['LOOKAHEAD_NOTES']),
