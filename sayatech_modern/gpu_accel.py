@@ -3,7 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 import sys
+import threading
+import time
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+
+from .safe_execution import safe_call
+
+# 异步 GPU 初始化相关
+_GPU_INIT_LOCK = threading.Lock()
+_GPU_BACKEND: Optional[ComputeBackend] = None
+_GPU_INIT_EVENT = threading.Event()
+_GPU_INIT_STARTED = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,8 +69,60 @@ def _resolve_compute_backend_cached(use_gpu: bool) -> ComputeBackend:
         return ComputeBackend(True, False, "cpu", "CPU", f"GPU 初始化失败：{exc}")
 
 
-def resolve_compute_backend(use_gpu: bool = False) -> ComputeBackend:
-    return _resolve_compute_backend_cached(bool(use_gpu))
+def _background_gpu_init():
+    """后台初始化 GPU"""
+    global _GPU_BACKEND
+    try:
+        from .crash_logging import append_runtime_log
+        append_runtime_log("GPU 初始化开始...", debug=True)
+        _GPU_BACKEND = _resolve_compute_backend_cached(True)
+        append_runtime_log(f"GPU 初始化完成: {_GPU_BACKEND.summary_text}", debug=True)
+    except Exception as e:
+        from .crash_logging import append_runtime_log
+        append_runtime_log(f"GPU 初始化异常: {e}", debug=True)
+        _GPU_BACKEND = ComputeBackend(True, False, "cpu", "CPU", str(e))
+    finally:
+        _GPU_INIT_EVENT.set()
+
+
+def start_gpu_init_async():
+    """启动异步 GPU 初始化"""
+    global _GPU_INIT_STARTED
+    with _GPU_INIT_LOCK:
+        if not _GPU_INIT_STARTED:
+            _GPU_INIT_STARTED = True
+            thread = threading.Thread(target=_background_gpu_init, daemon=True)
+            thread.start()
+
+
+def resolve_compute_backend(use_gpu: bool = False, wait: bool = False, timeout: float = 5.0) -> ComputeBackend:
+    """
+    获取计算后端
+
+    Args:
+        use_gpu: 是否请求 GPU
+        wait: 是否等待异步初始化完成
+        timeout: 等待超时时间（秒）
+    """
+    global _GPU_BACKEND
+
+    if not use_gpu:
+        return ComputeBackend(False, False, "cpu", "CPU", "未开启 GPU 加速")
+
+    # 如果异步初始化已完成，直接返回结果
+    if _GPU_BACKEND is not None:
+        return _GPU_BACKEND
+
+    # 等待异步初始化完成
+    if wait and not _GPU_INIT_EVENT.is_set():
+        _GPU_INIT_EVENT.wait(timeout=timeout)
+
+    # 如果异步初始化已完成，返回结果
+    if _GPU_BACKEND is not None:
+        return _GPU_BACKEND
+
+    # 回退到同步初始化
+    return _resolve_compute_backend_cached(use_gpu)
 
 
 def _normalize_bars(raw_bars: Sequence[float]) -> List[float]:
