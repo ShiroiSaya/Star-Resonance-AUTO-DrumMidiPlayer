@@ -11,6 +11,7 @@ import tempfile
 from typing import Any, Dict, Optional
 
 from .app_paths import cache_dir
+from .safe_execution import safe_call, safe_method
 
 CACHE_VERSION = "v2"
 _SECTIONS = {"analyses", "filtered", "tuner", "actions", "drum_reports"}
@@ -103,46 +104,64 @@ def _cache_file_stat(path: str) -> tuple[int, int]:
     return int(st.st_size), int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1_000_000_000)))
 
 
+@safe_method(log_errors=True)
 def load_pickle(section: str, key: str) -> Optional[Any]:
+    """从缓存加载 pickle 数据"""
     path = _path_for_key(section, key)
     if not os.path.exists(path):
         return None
+
     try:
         stat_key = _cache_file_stat(path)
         mem_key = (str(section), str(key), stat_key[0], stat_key[1])
         if mem_key in _MEMORY_CACHE:
             return _MEMORY_CACHE[mem_key]
+
         with gzip.open(path, "rb") as f:
             value = pickle.load(f)
+
         _MEMORY_CACHE[mem_key] = value
         return value
-    except Exception:
+    except Exception as e:
+        # 记录错误但不抛出异常，返回 None
+        from .crash_logging import append_runtime_log
+        append_runtime_log(f"缓存加载失败 {section}/{key}: {e}", debug=True)
         return None
 
 
+@safe_method(log_errors=True)
 def save_pickle(section: str, key: str, value: Any, *, meta: Optional[Dict[str, Any]] = None) -> str:
-    raw = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+    """保存到缓存"""
     try:
-        raw = pickletools.optimize(raw)
-    except Exception:
-        pass
-    payload = gzip.compress(raw, compresslevel=6)
-    path = _path_for_key(section, key)
-    _atomic_write_bytes(path, payload)
-    try:
-        stat_key = _cache_file_stat(path)
-        _MEMORY_CACHE[(str(section), str(key), stat_key[0], stat_key[1])] = value
-    except Exception:
-        pass
-    if meta is not None:
+        raw = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        raw = safe_call(pickletools.optimize, raw, default=raw)
+        payload = gzip.compress(raw, compresslevel=6)
+        path = _path_for_key(section, key)
+        _atomic_write_bytes(path, payload)
+
+        # 更新内存缓存
         try:
-            meta_path = _meta_path_for_key(section, key)
-            meta_payload = dict(meta)
-            meta_payload.setdefault("cache_version", CACHE_VERSION)
-            _atomic_write_bytes(meta_path, json.dumps(meta_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            stat_key = _cache_file_stat(path)
+            _MEMORY_CACHE[(str(section), str(key), stat_key[0], stat_key[1])] = value
         except Exception:
             pass
-    return path
+
+        # 保存元数据
+        if meta is not None:
+            try:
+                meta_path = _meta_path_for_key(section, key)
+                meta_payload = dict(meta)
+                meta_payload.setdefault("cache_version", CACHE_VERSION)
+                meta_json = json.dumps(meta_payload, ensure_ascii=False, separators=(",", ":"))
+                _atomic_write_bytes(meta_path, meta_json.encode("utf-8"))
+            except Exception:
+                pass
+
+        return path
+    except Exception as e:
+        from .crash_logging import append_runtime_log
+        append_runtime_log(f"缓存保存失败 {section}/{key}: {e}", debug=True)
+        return ""
 
 
 def cache_size_bytes() -> int:
@@ -168,7 +187,9 @@ def format_size(num_bytes: int) -> str:
     return f"{value:.1f} GB"
 
 
+@safe_method(log_errors=True)
 def clear_cache() -> None:
+    """清空所有缓存"""
     root = cache_root()
     for name in os.listdir(root):
         path = os.path.join(root, name)
