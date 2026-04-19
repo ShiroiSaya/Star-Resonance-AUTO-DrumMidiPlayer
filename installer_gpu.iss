@@ -1,9 +1,9 @@
-#define MyAppVersion "1.0.5"
+#define MyAppVersion "1.0.6"
 #define MyAppName "SayaTech MIDI Studio"
 #define MyAppPublisher "SayaTech"
 #define MyAppExeName "SayaTech_MIDI_Studio.exe"
 #define MyAppDisplayName "SayaTech MIDI Studio 满血版"
-#define MyOutputBaseFilename "SayaTech_MIDI_Studio_GPU_Setup_v1.0.5"
+#define MyOutputBaseFilename "SayaTech_MIDI_Studio_GPU_Setup_v1.0.6"
 #define MyAppId "{{5F172237-6D1B-4C7E-A3B8-B58BF199B8C9}"
 #define MyDistDir "dist\\SayaTech_MIDI_Studio_GPU"
 
@@ -24,7 +24,7 @@ WizardStyle=modern
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#MyAppExeName}
-VersionInfoVersion=1.0.5.0
+VersionInfoVersion=1.0.6.0
 
 [Languages]
 Name: "chinesesimplified"; MessagesFile: ".\\ChineseSimplified.isl"
