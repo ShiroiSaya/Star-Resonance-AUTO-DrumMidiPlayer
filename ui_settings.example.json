@@ -1,0 +1,19 @@
+{
+  "play_hotkey": "F10",
+  "pause_hotkey": "F11",
+  "stop_hotkey": "F12",
+  "play_hotkey_enabled": true,
+  "pause_hotkey_enabled": true,
+  "stop_hotkey_enabled": true,
+  "dark_mode": false,
+  "theme_preset": "ocean",
+  "ui_scale": 100,
+  "animations_enabled": true,
+  "animation_speed": 100,
+  "debug_mode": false,
+  "glass_blur": 58,
+  "splash_enabled": true,
+  "splash_duration_ms": 3000,
+  "gpu_acceleration": false,
+  "performance_mode": false
+}
